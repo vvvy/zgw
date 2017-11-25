@@ -1,0 +1,13 @@
+[package]
+name = "zgwa"
+version = "0.1.0"
+authors = ["Valery Vybornov <vvybornov@gmail.com>"]
+
+[dependencies]
+zgwlib = { path = "../zgwlib" }
+log = "0.3"
+serde_json = "1.0"
+serde = "1.0"
+serde_derive = "1.0"
+hyper = "0.10"
+hyper-native-tls = "0.2"
