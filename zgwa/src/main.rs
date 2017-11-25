@@ -20,62 +20,12 @@ mod w_client_stdio;
 mod config;
 
 pub use zgwlib::*;
-use config::*;
 use zgwlib::config::*;
-
+use config::*;
 
 use std::path::PathBuf;
 use std::sync::mpsc::channel;
 
-fn parse_command_line(cfg: &mut AppConfig) {
-    let mut username: Option<String> = None;
-    let mut password = "*".to_owned();
-
-    match std::env::args().skip(1).flat_map(convert_arg).fold(None, |s, a| match s {
-        None => match a.as_ref() {
-            "-f"|"--fg" => { cfg.g.daemonize = false; None },
-            "-x"|"--reset-config" => { *cfg = AppConfig::default(); None},
-            "-h"|"--help" => help(),
-            _ => Some(a)
-        },
-        Some(ref a0) => {
-            match a0.as_ref() {
-                "-C"|"--config-file" => *cfg = read_config(&a).expect("unable to read config file"),
-                "-W"|"--write-config-file" => save_config_file(&a, &cfg),
-                "-w"|"--cd" => std::env::set_current_dir(PathBuf::from(a)).expect("unable to cd"),
-                "-l"|"--log-file" => cfg.g.log_file = Some(PathBuf::from(a)),
-                "-L"|"--log-level" => cfg.g.log_level = a,
-                "-P"|"--z-files" => cfg.z.sd = SD::Files(a),
-                "-U"|"--z-url" => cfg.z.sd = SD::URL(a),
-                "-S"|"--z-secure-url" => { cfg.z.sd = SD::SURL(a, Creds::new_opt(&username, &password)) },
-                "-d"|"--z-delay" => cfg.z.delay_s = a.parse().expect("expected an int to `--z-delay`"),
-                "-e"|"--z-period" => cfg.z.period_max_s = a.parse().expect("expected an int to `--z-period`"),
-                "-i"|"--z-period-min" => cfg.z.period_min_s = a.parse().expect("expected an int to `--z-period-min`"),
-                "-A"|"--w-files" => cfg.w.sd = SD::Files(a),
-                "-Q"|"--w-url" => cfg.w.sd = SD::URL(a),
-                "-X"|"--w-secure-url" => { cfg.w.sd = SD::SURL(a, Creds::new_opt(&username, &password)) },
-                "-j"|"--w-max-send-count" => cfg.w.max_send_count = a.parse().expect("expected unsigned int to --w-max-send-count"),
-                "-B"|"--w-period-long"  => cfg.w.period_long_s = a.parse().expect("expected unsigned int to --w-period-long"),
-                "-b"|"--w-period-short"  => cfg.w.period_short_s = a.parse().expect("expected unsigned int to --w-period-short"),
-                "-y"|"--w-error-delay"  => cfg.w.delay_error_s = a.parse().expect("expected unsigned int to --w-error-delay"),
-                "-g"|"--device-config-line" => cfg.c.push(parse_line(&a).expect("error parsing --device-config-line")),
-                "-u"|"--username" => username = match a.as_ref() { "-" => None, v => Some(v.to_owned()) },
-                "-p"|"--password" => password = a,
-                "--pid-file" => cfg.d.pid_file = Some(a),
-                "--chown-pid-file" => cfg.d.chown_pid_file = Some(bool_opt(a)),
-                "--daemon-user" => cfg.d.user = Some(a),
-                "--daemon-group" => cfg.d.group = Some(a),
-                "--daemon-group-n" => cfg.d.group_n = Some(a.parse().expect("expected unsigned int to --daemon-group-n")),
-                _ => panic!("Invalid cmd line at `{} {}`", a0, a)
-            };
-            None
-        }
-    }) {
-        None => (),
-        Some(ref e) => panic!("Invalid cmd line at `{}`<EOL>", e)
-    }
-
-}
 
 fn main() {
     let mut cfg = read_default_config("zgwa.yaml").expect("unable to process default config file");
@@ -85,12 +35,22 @@ fn main() {
     run_client(z, w, c, cwd);
 }
 
+fn version() -> ! {
+    println!(
+        "{} ({}) version {}",
+        env!("CARGO_PKG_DESCRIPTION"),
+        env!("CARGO_PKG_NAME"),
+        env!("CARGO_PKG_VERSION")
+    );
+    std::process::exit(0);
+}
 
 fn help() -> ! {
     println!(
         "Help
 
 -h|--help                           this message
+-v|--version                        print version information and exit
 
 Configuration and CWD (these options are executed immediately once parsed):
 
@@ -137,6 +97,57 @@ UNIX only:
 ");
 
     std::process::exit(0);
+}
+
+fn parse_command_line(cfg: &mut AppConfig) {
+    let mut username: Option<String> = None;
+    let mut password = "*".to_owned();
+
+    match std::env::args().skip(1).flat_map(convert_arg).fold(None, |s, a| match s {
+        None => match a.as_ref() {
+            "-f"|"--fg" => { cfg.g.daemonize = false; None },
+            "-x"|"--reset-config" => { *cfg = AppConfig::default(); None},
+            "-h"|"--help" => help(),
+            "-v"|"--version" => version(),
+            _ => Some(a)
+        },
+        Some(ref a0) => {
+            match a0.as_ref() {
+                "-C"|"--config-file" => *cfg = read_config(&a).expect("unable to read config file"),
+                "-W"|"--write-config-file" => save_config_file(&a, &cfg),
+                "-w"|"--cd" => std::env::set_current_dir(PathBuf::from(a)).expect("unable to cd"),
+                "-l"|"--log-file" => cfg.g.log_file = Some(PathBuf::from(a)),
+                "-L"|"--log-level" => cfg.g.log_level = a,
+                "-P"|"--z-files" => cfg.z.sd = SD::Files(a),
+                "-U"|"--z-url" => cfg.z.sd = SD::URL(a),
+                "-S"|"--z-secure-url" => { cfg.z.sd = SD::SURL(a, Creds::new_opt(&username, &password)) },
+                "-d"|"--z-delay" => cfg.z.delay_s = a.parse().expect("expected an int to `--z-delay`"),
+                "-e"|"--z-period" => cfg.z.period_max_s = a.parse().expect("expected an int to `--z-period`"),
+                "-i"|"--z-period-min" => cfg.z.period_min_s = a.parse().expect("expected an int to `--z-period-min`"),
+                "-A"|"--w-files" => cfg.w.sd = SD::Files(a),
+                "-Q"|"--w-url" => cfg.w.sd = SD::URL(a),
+                "-X"|"--w-secure-url" => { cfg.w.sd = SD::SURL(a, Creds::new_opt(&username, &password)) },
+                "-j"|"--w-max-send-count" => cfg.w.max_send_count = a.parse().expect("expected unsigned int to --w-max-send-count"),
+                "-B"|"--w-period-long"  => cfg.w.period_long_s = a.parse().expect("expected unsigned int to --w-period-long"),
+                "-b"|"--w-period-short"  => cfg.w.period_short_s = a.parse().expect("expected unsigned int to --w-period-short"),
+                "-y"|"--w-error-delay"  => cfg.w.delay_error_s = a.parse().expect("expected unsigned int to --w-error-delay"),
+                "-g"|"--device-config-line" => cfg.c.push(parse_line(&a).expect("error parsing --device-config-line")),
+                "-u"|"--username" => username = match a.as_ref() { "-" => None, v => Some(v.to_owned()) },
+                "-p"|"--password" => password = a,
+                "--pid-file" => cfg.d.pid_file = Some(a),
+                "--chown-pid-file" => cfg.d.chown_pid_file = Some(bool_opt(a)),
+                "--daemon-user" => cfg.d.user = Some(a),
+                "--daemon-group" => cfg.d.group = Some(a),
+                "--daemon-group-n" => cfg.d.group_n = Some(a.parse().expect("expected unsigned int to --daemon-group-n")),
+                _ => panic!("Invalid cmd line at `{} {}`", a0, a)
+            };
+            None
+        }
+    }) {
+        None => (),
+        Some(ref e) => panic!("Invalid cmd line at `{}`<EOL>", e)
+    }
+
 }
 
 fn run_client(mut z: ZOptions, mut w: WOptions, c: DeviceConfig, cwd: PathBuf) {

@@ -1,2 +1,2 @@
 [workspace]
-members=["zgwlib", "zgwa"]
+members=["zgwlib", "zgwa","zgws"]
