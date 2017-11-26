@@ -125,7 +125,7 @@ fn run_server(u: UOptions, cwd: PathBuf) {
     use std::fs::create_dir_all;
 
     let (send, recv) = channel::<UWEvt>();
-    match run_uw_server_hyper(&u.hostport, UWServerRunner::new(send, 64)) {
+    match run_uw_server_hyper(&u.hostport, UWServerRunner::new(send, 64), u.nv_types) {
         Ok(mut listener) => {
             //TODO: add these 3 to config + options
             let report_dir = u.report_dir.unwrap_or_else(||cwd.join(Path::new("report")));

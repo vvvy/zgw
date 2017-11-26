@@ -1,5 +1,6 @@
 use std::default::Default;
 use std::path::PathBuf;
+use std::collections::hash_map::HashMap;
 use zgwlib::config::*;
 
 #[derive(Serialize, Deserialize)]
@@ -29,7 +30,8 @@ impl Default for AppConfig {
                 hostport: "0.0.0.0:7899".to_string(),
                 report_dir: None,
                 records_per_logfile: 10000,
-                n_logs: 3
+                n_logs: 3,
+                nv_types: HashMap::new()
             }
         }
     }
@@ -40,7 +42,8 @@ pub struct UOptions {
     pub hostport: String,
     pub report_dir: Option<PathBuf>,
     pub records_per_logfile: u32,
-    pub n_logs: i8
+    pub n_logs: i8,
+    pub nv_types: HashMap<String, String>
 }
 /*
 impl UOptions {

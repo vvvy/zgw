@@ -38,6 +38,26 @@ impl fmt::Display for NodeValue {
     }
 }
 
+impl NodeValue {
+    pub fn from_strings(k: &str, v: String) -> Result<NodeValue, String> {
+        if k == "String" { Ok(NodeValue::String(v)) }
+            else if k == "Float" { v.parse().map(|v| NodeValue::Float(v)).map_err(|e| format!("Float parse: {}", e)) }
+                else if k == "Int" { v.parse().map(|v| NodeValue::Int(v)).map_err(|e| format!("Int parse: {}", e)) }
+                    else if k == "Bool" {
+                        if v == "true" { Ok(NodeValue::Bool(true)) }
+                            else if v == "false" { Ok(NodeValue::Bool(false)) }
+                                else { Err(format!("Bool parse: invalid constant `{}`", v))}
+                    }
+                        //TODO: StringArray, IntArray, Binary
+                        else { Err(format!("Invalid NV: k={}, v={}", k, v)) }
+    }
+
+    pub fn from_string(k: &str) -> Result<NodeValue, String> {
+        if k == "Null" { Ok(NodeValue::Null) }
+            else { Err(format!("Invalid NV: k={}", k)) }
+    }
+}
+
 impl FromStr for NodeValue {
     type Err = String;
 
@@ -67,20 +87,8 @@ impl FromStr for NodeValue {
                 (_, ch) => S::ERR(format!("parse error at `{}`", ch))
             }
         ) {
-            S::R(k, v) =>
-                if k == "String" { Ok(NodeValue::String(v)) }
-                    else if k == "Float" { v.parse().map(|v| NodeValue::Float(v)).map_err(|e| format!("Float parse: {}", e)) }
-                        else if k == "Int" { v.parse().map(|v| NodeValue::Int(v)).map_err(|e| format!("Int parse: {}", e)) }
-                            else if k == "Bool" {
-                                if v == "true" { Ok(NodeValue::Bool(true)) }
-                                    else if v == "false" { Ok(NodeValue::Bool(false)) }
-                                        else { Err(format!("Bool parse: invalid constant `{}`", v))}
-                            }
-                                //TODO: StringArray, IntArray, Binary
-                                else { Err(format!("Invalid NV: k={}, v={}", k, v)) },
-            S::K(k) =>
-                if k == "Null" { Ok(NodeValue::Null) }
-                    else { Err(format!("Invalid NV: k={}", k))},
+            S::R(k, v) => NodeValue::from_strings(&k, v),
+            S::K(k) => NodeValue::from_string(&k),
             _ => Err("Invalid NV format".to_string())
         }
     }
@@ -109,10 +117,10 @@ pub struct TsNodeValue {
 
 impl TsNodeValue {
     //fn null() -> TsNodeValue { TsNodeValue { value: NodeValue::Null, ts: 0 } }
-    //fn make(v: NodeValue, ts: u32) -> TsNodeValue { TsNodeValue { value: v, ts: ts } }
-    pub fn from_string_and_ts(s: &str, ts: u32) -> Result<TsNodeValue, String> {
-        s.parse().map(|nv| TsNodeValue { value: nv, ts: ts })
-    }
+    pub fn new(v: NodeValue, ts: u32) -> TsNodeValue { TsNodeValue { value: v, ts: ts } }
+    //pub fn from_string_and_ts(s: &str, ts: u32) -> Result<TsNodeValue, String> {
+    //    s.parse().map(|nv| TsNodeValue { value: nv, ts: ts })
+    //}
 }
 
 

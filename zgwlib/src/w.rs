@@ -7,18 +7,28 @@ use nv::*;
 use Result;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct UserUpdate(pub String, pub TsNodeValue);
+pub enum UserUpdate {
+    Set(String, TsNodeValue),
+    Get(String)
+}
 
 impl UserUpdate {
-    //pub fn new(id: String, value: TsNodeValue) -> UserUpdate { UserUpdate(id, value) }
-    pub fn from_strings_and_ts(id: String, value: &str, ts: u32) -> Result<UserUpdate> {
-        TsNodeValue::from_string_and_ts(value, ts).map(|tnv| UserUpdate(id, tnv))
+    pub fn new_set(id: String, value: TsNodeValue) -> UserUpdate { UserUpdate::Set(id, value) }
+    /*pub fn make_set(id: String, value: &str, ts: u32) -> Result<UserUpdate> {
+        TsNodeValue::from_string_and_ts(value, ts).map(|tnv| UserUpdate::Set(id, tnv))
         //value.parse().map(|v| UserUpdate(id, v))
-    }
+    }*/
+
+    pub fn new_get(id: String) -> UserUpdate { UserUpdate::Get(id) }
 }
 
 impl AsRef<String> for UserUpdate {
-    fn as_ref(&self) -> &String { &self.0 }
+    fn as_ref(&self) -> &String {
+        match self {
+            &UserUpdate::Get(ref id) => id,
+            &UserUpdate::Set(ref id, _) => id,
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -54,8 +64,21 @@ impl Target<NetUpdate> for Sender<WCmd> {
 
 impl Target<UserUpdate> for Sender<WCmd> {
     fn consume(&self, d: Vec<UserUpdate>) -> Result<()> {
-        for UserUpdate(l, tnv) in d {
-            match self.send(WCmd::UserUpdate(l, tnv)) {
+        /*d.into_iter().map(|uu| match uu {
+            UserUpdate::Set(id, tnv) => WCmd::UserUpdate(id, tnv),
+            UserUpdate::Get(id) => WCmd::UserGet(id)
+        }).for_each(|wcmd| match self.send(wcmd) {
+            Ok(_) => (),
+            Err(_) => return Err("feed failed (Disconnect)".to_string())
+        });
+
+        */
+        for uu in d {
+            let wcmd = match uu {
+                UserUpdate::Set(id, tnv) => WCmd::UserUpdate(id, tnv),
+                UserUpdate::Get(id) => WCmd::UserGet(id)
+            };
+            match self.send(wcmd) {
                 Ok(_) => (),
                 Err(_) => return Err("feed failed (Disconnect)".to_string())
             }
@@ -96,7 +119,6 @@ impl Target<NetUpdate> for Sender<UWEvt> {
 }
 
 
-
 /// Full duplex endpoint
 pub struct Endpoint<L, T> {
     sq: SQ<String, L>,
@@ -124,14 +146,17 @@ impl<L, T> Endpoint<L, T> where L: AsRef<String> + Clone {
         }
         let ref t = self.t;
         match self.qrecv.feed_through(Feed(m.d, m.n), |v| t.consume(v)) {
-            Err(e) => { error!("consume: {}", e); false }
+            Err(e) => {
+                error!("consume: {}", e);
+                false
+            }
             Ok(_) => { true }
         }
     }
 
     pub fn produce(&mut self, count_max: usize) -> (FdxMsg<L>, bool) {
         let (Feed(d, n), more) = self.sq.get_feed(count_max);
-        (FdxMsg { d: d, n: n, rn: self.qrecv.acked()  }, more)
+        (FdxMsg { d: d, n: n, rn: self.qrecv.acked() }, more)
     }
 
     /// Consumes messages from m, returning pending messages from the queue, wrapped in FdxMsg
@@ -157,6 +182,6 @@ pub struct WUserMsg {
 
 impl WUserMsg {
     pub fn acked(nm: &WNetMsg) -> WUserMsg {
-        WUserMsg { ud: FdxMsg { d: Vec::new(), n: 0, rn: nm.nd.n, }, more: false  }
+        WUserMsg { ud: FdxMsg { d: Vec::new(), n: 0, rn: nm.nd.n }, more: false }
     }
 }
