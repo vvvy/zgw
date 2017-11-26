@@ -23,6 +23,7 @@ pub type Err = String;
 /// Result type
 pub type Result<T> = std::result::Result<T, Err>;
 
+/*
 #[cfg(test)]
 mod tests {
     #[test]
@@ -30,3 +31,4 @@ mod tests {
     }
 }
 
+*/

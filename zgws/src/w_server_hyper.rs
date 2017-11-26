@@ -57,6 +57,15 @@ impl UWServerHandler {
     }
 }
 
+#[derive(Serialize, Deserialize, Debug)]
+#[serde(tag = "status")]
+enum UResponse {
+    #[serde(rename="ok")]
+    Ok { },
+    #[serde(rename="error")]
+    Error { message: String }
+}
+
 impl Handler for UWServerHandler {
     fn handle(&self, req: Request, mut res: SResponse) {
         //TODO: check for content-type=application/json
@@ -109,9 +118,9 @@ impl Handler for UWServerHandler {
                         move |mut uws| uws.push(UserUpdate::new_get(id))
                     ).map_err(
                         |e| format!("Mutex poison error {}", e)
-                    );
+                    ).map(|_| UResponse::Ok {});
 
-                debug!("[N] Reply: {:?}", umsgr);
+                debug!("[U] Reply: {:?}", umsgr);
 
                 umsgr.and_then(
                     |umsg| serde_json::to_vec(&umsg)
@@ -138,9 +147,9 @@ impl Handler for UWServerHandler {
                         move |mut uws| uws.push(uu)
                     ).map_err(
                         |e| format!("Mutex poison error {}", e)
-                    ));
+                    )).map(|_| UResponse::Ok {});;
 
-                debug!("[N] Reply: {:?}", umsgr);
+                debug!("[U] Reply: {:?}", umsgr);
 
                 umsgr.and_then(
                     |umsg| serde_json::to_vec(&umsg)
@@ -157,7 +166,12 @@ impl Handler for UWServerHandler {
             Err(e) => {
                 error!("Error processing request: {}", e);
                 *res.status_mut() = StatusCode::BadRequest;
-                res.send(&format!("error: {}", e).into_bytes())
+
+                res.send(
+                    &serde_json::to_vec(&UResponse::Error { message: e }).unwrap_or_else(
+                        |e| format!("status: error, message: {}", e).into_bytes()
+                    )
+                )
             }
         };
 
