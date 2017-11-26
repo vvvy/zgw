@@ -26,9 +26,7 @@ and control.
 
 Configuration is provided via YAML files.
 
-### Agent 
-
-#### Sample configuration
+### Agent-- Sample configuration
 
 ```yaml
 
@@ -171,7 +169,7 @@ The username/password section is optional. This is how the Secure URL setting wi
 
 #### Password file
 
-Upon startup, the app looks for a file in the CWD named `.zpasswd`. If present, the file is read and parsed as following.
+Upon startup, `zgwa` looks for a file in the CWD named `.zpasswd`. If present, the file is read and parsed as following.
 
 Each line of the password file should have three whitespace-separated fields:
 
