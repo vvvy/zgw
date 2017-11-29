@@ -1,5 +1,5 @@
 use std::thread::{self, JoinHandle};
-use tree::{TreeNode, CoTrigger, new_update_collector};
+use tree::{TreeNode, CoTrigger, UpdateCollector};
 use std::time::Duration;
 use std::io::Read;
 use std::sync::mpsc::{Receiver, Sender, RecvTimeoutError};
@@ -62,7 +62,7 @@ pub fn run_z_client(cfg: ZConfig,
                     error!("Invalid NetUpdate({},{})", n, tnv),
                 Err(RecvTimeoutError::Timeout) => {
                     //apply tree updates
-                    let mut uc = new_update_collector();
+                    let mut uc = UpdateCollector::new();
                     match client.collect_updates(
                         root.get_update_time().unwrap_or(0),
                         &mut (ZNotificationTargetImpl::new(&mut root, &mut uc))

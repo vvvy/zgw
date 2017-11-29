@@ -149,9 +149,13 @@ pub struct UpdateCollector {
     pub updates: BTreeMap<String, NodeData>
 }
 
-pub fn new_update_collector() -> UpdateCollector {
-    UpdateCollector { updates: BTreeMap::new() }
+impl UpdateCollector {
+    pub fn new() -> UpdateCollector {
+        UpdateCollector { updates: BTreeMap::new() }
+    }
+
 }
+
 
 impl CoTrigger for UpdateCollector {
     fn fire<'t>(&'t mut self, trigger: &'t Trigger, node_data: &'t NodeData) {
