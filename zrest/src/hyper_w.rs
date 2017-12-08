@@ -5,7 +5,7 @@ use tokio_core::reactor::Core;
 
 use hyper;
 use hyper::{Client, Request, Response, Body, StatusCode, Uri, Method};
-use hyper::header::{Authorization, Basic};
+use hyper::header::{Authorization, Basic, ContentType};
 use hyper::client::{HttpConnector, FutureResponse};
 use hyper_tls::HttpsConnector;
 use serde;
@@ -19,8 +19,13 @@ pub trait CoreH {
     fn recv_sync<R>(&mut self, fr: FutureResponse) -> ZRResult<R> where R: serde::de::DeserializeOwned {
         let work =
             fr
-                .map_err(|e| ZRError::from(e))
-                .and_then(|res|
+                .map_err(
+                    |e| ZRError::from(e)
+                ).and_then(
+                |res| if res.headers().get::<ContentType>() != Some(&ContentType::json())
+                    { Ok(res) }
+                    else { Err(ZRError::EZR("invalid content type".to_string())) }
+                ).and_then(|res|
                     res.body()
                         .concat2()
                         .map_err(|e| ZRError::from(e))
@@ -48,22 +53,23 @@ pub trait ZClient : CoreH {
 
     // Performs sync POST
     #[inline]
-    fn b_post<R>(&mut self, uri: Uri, b: Body) -> ZRResult<R> where R: serde::de::DeserializeOwned {
-        let mut req = Request::new(Method::Post, uri);
-        req.set_body(b);
-        let x = self.req_fr(req);
-        self.recv_sync(x)
-    }
-
-    // Performs sync POST
-    #[inline]
-    fn post<Q, R>(&mut self, uri: Uri, q: &Q) -> ZRResult<R> where
+    fn post<Q, R>(&mut self, uri: Uri, q: &Q, authOpt: &Option<(String, String)>) -> ZRResult<R> where
         Q: serde::ser::Serialize,
         R: serde::de::DeserializeOwned {
         let mut req= Request::new(Method::Post, uri);
         let data =  serde_json::to_vec(q)?;
         let body: Body = data.into();
         req.set_body(body);
+        {
+            let h = req.headers_mut();
+            h.set(ContentType::json());
+            match authOpt {
+                &Some((ref user, ref pass)) => h.set(
+                    Authorization(Basic { username: user.clone(), password: Some(pass.clone()) }
+                    )),
+                    _=> ()
+            };
+        }
         let x = self.req_fr(req);
         self.recv_sync(x)
     }
