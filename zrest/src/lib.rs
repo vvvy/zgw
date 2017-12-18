@@ -11,6 +11,8 @@ extern crate mime;
 
 mod hyper_w;
 mod hyper_server;
+mod uri_scanner;
+mod router;
 
 #[derive(Debug)]
 pub enum ZRError {
@@ -18,6 +20,7 @@ pub enum ZRError {
     EHTLS(native_tls::Error),
     ESJ(serde_json::Error),
     EIO(std::io::Error),
+    ESc(uri_scanner::SErr),
     EZR(String)
 }
 
@@ -37,6 +40,10 @@ impl From<serde_json::Error> for ZRError {
 
 impl From<std::io::Error> for ZRError {
     fn from(e: std::io::Error) -> Self { ZRError::EIO(e) }
+}
+
+impl From<uri_scanner::SErr> for ZRError {
+    fn from(e: uri_scanner::SErr) -> Self { ZRError::ESc(e) }
 }
 
 
