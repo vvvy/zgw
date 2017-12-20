@@ -51,6 +51,10 @@ impl<'t> From<&'t str> for Condition {
     fn from(s: &'t str) -> Self { Condition::CStr(s.to_owned()) }
 }
 
+impl From<VarType> for Condition {
+    fn from(vt: VarType) -> Self { Condition::Var(vt) }
+}
+
 
 /// Tree action type
 #[derive(Debug)]
@@ -114,9 +118,6 @@ impl<C> ChildrenAnalysisResult<C> {
     }
 }
 
-
-
-
 impl<C> BNode<C> {
     #[inline]
     fn new() -> BNode<C> { BNode::create(HashMap::new()) }
@@ -154,7 +155,17 @@ impl<C> SyncJsonF1<C> for Echo {
 }
 
 #[derive(Debug)]
-struct Builder<C> {
+struct Fail;
+
+impl<C> SyncJsonF0<C> for Fail {
+    fn apply(&self, cx: &mut C, vals: &[Val]) -> Body {
+        Body::from("failed")
+    }
+}
+
+
+#[derive(Debug)]
+pub struct Builder<C> {
     root: BNode<C>
 }
 
@@ -163,7 +174,7 @@ macro_rules! assert_none(
 { $value:expr } => { assert!(($value).is_none()) }
 );
 
-macro_rules! sconds(
+macro_rules! route_expr(
     { $($value:expr),+ } => {
         {
             let mut v = ::std::vec::Vec::new();
@@ -176,7 +187,7 @@ macro_rules! sconds(
 );
 
 impl<C> Builder<C> where C: std::fmt::Debug {
-    fn new() -> Builder<C> { Builder { root: BNode::new() } }
+    pub fn new() -> Builder<C> { Builder { root: BNode::new() } }
 
     fn print(&self) {
         use std::iter::FromIterator;
@@ -195,7 +206,7 @@ impl<C> Builder<C> where C: std::fmt::Debug {
         line(&self.root, 0);
     }
 
-    fn mount(&mut self, condition: Vec<Condition>, a: Action<C>) {
+    pub fn mount(&mut self, condition: Vec<Condition>, a: Action<C>) {
         fn step<'t, C: 't>(n: &'t mut BNode<C>, condition: &[Condition], a: Action<C>) {
             match condition.first() {
                 Some(cond) =>
@@ -217,9 +228,9 @@ impl<C> Builder<C> where C: std::fmt::Debug {
 #[test]
 fn test_rest_server_builder() {
     let mut b = Builder::<String>::new();
-    b.mount(sconds!("s1", "s2"), Action::f1(Echo));
+    b.mount(route_expr!("s1", "s2"), Action::f1(Echo));
     //println!("{:?}", b);
-    b.mount(sconds!("s1", "s2a"), Action::f1(Echo));
+    b.mount(route_expr!("s1", "s2a"), Action::f1(Echo));
     println!("------------------------------------------");
     b.print();
     println!("------------------------------------------");
@@ -236,6 +247,9 @@ enum RCond {
 }
 
 type Label = usize;
+
+#[inline]
+fn mirror_label(l: Label) -> Label { usize::max_value() - l }
 
 /// Runner node
 #[derive(Debug)]
@@ -254,23 +268,78 @@ struct CodeChunk<C> {
     body: CodeChunkBody<C>
 }
 
+
+/// allocates and returns virtual labels.
+/// Virtual labels grow from `usize::max_value()` down
+struct LabelAllocator {
+    next_n: Label
+}
+
+impl LabelAllocator {
+    fn new() -> LabelAllocator { LabelAllocator { next_n: 0 }}
+    fn get_next(&mut self) -> Label {
+        let l = self.next_n;
+        self.next_n += 1;
+        mirror_label(l)
+    }
+    /// ensure that virtual and physical labels do not overlap
+    fn validate(&self, code_size: usize) -> bool {
+        code_size <= mirror_label(self.next_n)
+    }
+}
+
+/// holds mapping of virtual labels to physical offsets
+struct LabelTable {
+    t: Vec<Option<Label>>,
+    threshold: Label
+}
+
+impl LabelTable {
+    fn new(la: LabelAllocator) -> LabelTable {
+        LabelTable {
+            t: std::iter::repeat(None).take(la.next_n).collect(),
+            threshold: mirror_label(la.next_n)
+        }
+    }
+
+    /// fix the label's position and complain if already fixed
+    fn set_pos(&mut self, label: Label, pos: Label) {
+        let mut swapped = Some(pos);
+        std::mem::swap(&mut swapped, &mut self.t[mirror_label(label)]);
+        assert_none!(swapped);
+    }
+
+    /// if the label is virtual, convert it to physical.
+    fn materialize(&self, l: Label) -> ZRResult<Label> {
+        if l > self.threshold {
+            self.t[mirror_label(l)].ok_or(ZRError::EZR(format!("internal error: missing label ({})", l)))
+        } else {
+            Ok(l)
+        }
+    }
+
+}
+
 use std::collections::LinkedList;
 
 struct RTreeBuildContext<C> {
-    next_label: Label,
+    la: LabelAllocator,
     result: Vec<CodeChunk<C>>,
+    l_failure: Label,
     err: Option<String>
 }
 
 impl<C> RTreeBuildContext<C> {
-    const FAILURE_POS: Label = 0;
-
     fn new() -> RTreeBuildContext<C> {
         let mut r = Vec::new();
-        r.push(CodeChunk { label: Self::FAILURE_POS, body: CodeChunkBody::Action(Action::f1(Echo)) });
+        let mut la = LabelAllocator::new();
+        let l_failure = la.get_next();
+
+        r.push(CodeChunk { label: l_failure, body: CodeChunkBody::Action(Action::f0(Fail)) });
         RTreeBuildContext {
-            next_label: r.len(),
+            la: la,
             result: r,
+            l_failure: l_failure,
             err: None
         }
     }
@@ -282,8 +351,7 @@ impl<C> RTreeBuildContext<C> {
     }
 
     fn add_chunk(&mut self, body: CodeChunkBody<C>) -> Label {
-        let l = self.next_label;
-        self.next_label +=1;
+        let l = self.la.get_next();
         self.result.push(CodeChunk { label: l, body: body });
         l
     }
@@ -304,7 +372,10 @@ impl<C> RTreeBuildContext<C> {
     }
 
     fn emit(&mut self, b: Builder<C>) -> Label {
-        self.bnode(b.root)
+        let e0 = self.bnode(b.root);
+        //insert match for initial /
+        let f = self.l_failure;
+        self.add_branch_opt(Some((RCond::Sep, e0)), f)
     }
 
     /// emit action node
@@ -325,9 +396,10 @@ impl<C> RTreeBuildContext<C> {
         fn s2cl(s: String) ->  LinkedList<char> { s.chars().collect() }
 
         let anode_l = self.anode(action);
+        let f = self.l_failure;
         let exit_step = self.add_branch_opt(
             anode_l.map(|apos| (RCond::EOT, apos)),
-            Self::FAILURE_POS
+            f
         );
 
         match ChildrenAnalysisResult::analyze_children(children) {
@@ -347,7 +419,7 @@ impl<C> RTreeBuildContext<C> {
             },
             ChildrenAnalysisResult::Err(desc) => {
                 self.err = Some(desc);
-                Self::FAILURE_POS
+                self.l_failure
             }
         }
     }
@@ -390,30 +462,26 @@ impl<C> RTreeBuildContext<C> {
 
 use uri_scanner::*;
 
-type Pos = usize;
 
-struct RTree<C> {
+
+pub struct RTree<C> {
     tree: Vec<RNode<C>>,
-    init: Pos
+    init: Label
 }
 
-impl<C> RTree<C> {
-    fn build(b: Builder<C>) -> ZRResult<RTree<C>> {
-        let (RTreeBuildContext { next_label: label_count, result: chunks, err }, entry) =
+impl<C> RTree<C> where C: std::fmt::Debug {
+    pub fn build(b: Builder<C>) -> ZRResult<RTree<C>> {
+        let (RTreeBuildContext { la: la, result: chunks, err, l_failure: _ }, entry) =
             RTreeBuildContext::create(b);
 
         //label table. for each label (@offset), holds its offset within the resulting tree
-        let mut label_table: Vec<Option<Pos>> =
-            std::iter::repeat(None).take(label_count).collect();
+        let mut label_table = LabelTable::new(la);
         let mut tree: Vec<RNode<C>> = Vec::new();
 
         //pass one: emit chunks into the three, registering actual label positions into label_table
         for CodeChunk { label: chunk_label, body: chunk_body } in chunks {
             let tpos = tree.len();
-            //fix the label's position and complain if already fixed
-            let mut swapped = Some(tpos);
-            std::mem::swap(&mut swapped, &mut label_table[chunk_label]);
-            assert_none!(swapped);
+            label_table.set_pos(chunk_label, tpos);
 
             //emit chunk's body
             tree.append(&mut match chunk_body {
@@ -434,36 +502,34 @@ impl<C> RTree<C> {
         for n in &mut tree {
             match n {
                 &mut RNode::Branch { cond: _, b_success: ref mut s, b_failure: ref mut f  } => {
-                    *s = label_table[*s].unwrap();
-                    *f = label_table[*f].unwrap();
+                    *s = label_table.materialize(*s)?;
+                    *f = label_table.materialize(*f)?;
                 },
                 _ => ()
             }
         }
 
-        Ok(RTree { tree: tree, init: label_table[entry].unwrap() })
+        Ok(RTree { tree: tree, init: label_table.materialize(entry)? })
     }
 
-
-
-    /*
     fn print(&self) {
-        fn step<C>(n: &RNode<C>, pos: Pos, indent: usize) {
-            let head = format!("[{:#03}]{:ind$}", pos, "", ind=indent);
+        for (pos, n) in self.tree.iter().enumerate() {
+            print!("{}[{:#03}]  ", if pos == self.init { "*" } else { " " }, pos);
             match n {
-                &RNode::Branch { cond, b_success, b_faiure }
+                &RNode::Branch { ref cond, ref b_success, ref b_failure } =>
+                    println!("{:?} {} {}", cond, b_success, b_failure),
+                &RNode::Run(ref a) =>
+                    println!("! {:?}", a)
             }
-
         }
     }
-    */
 
-    fn run(&self, s: String) -> ZRResult<&Action<C>> {
+    pub fn run(&self, s: &str) -> ZRResult<&Action<C>> {
         let mut sc = Scanner::new(&s);
 
         enum O {
-            SG(Pos),
-            G(Pos),
+            SG(Label),
+            G(Label),
             S
         };
 
@@ -474,19 +540,19 @@ impl<C> RTree<C> {
         loop {
             match &self.tree[cp] {
                 &RNode::Run(ref a) => break Ok(a),
-                &RNode::Branch { cond: ref cond, b_success, b_failure } => {
-                    if cv.is_none() { match sc.get_error() {
-                        Some(serr) => break Err(ZRError::from(serr.clone())),
-                        _ => ()
-                    } }
-
+                &RNode::Branch { ref cond, b_success, b_failure } => {
                     let res = match (&cv, cond) {
+                        (&Some(E::ERR(serr)), _) => break Err(ZRError::from(serr.clone())),
                         (&Some(E::CH(ch1)), &RCond::Ch(ch2)) if ch1 == ch2 => O::SG(b_success),
                         (&Some(E::ST), &RCond::Sep) => O::SG(b_success),
                         (&None, &RCond::EOT) => O::SG(b_success),
+                        (&Some(E::CH(ch)), &RCond::Var(_)) => {
+                            vars.last_mut().map(|mut el| el.push(ch));
+                            O::S
+                        },
+                        (&Some(E::ST), &RCond::Var(_)) => O::SG(b_success),
                         _ => O::G(b_failure)
                     };
-
                     match res {
                         O::SG(pos) => { cv = sc.next(); cp = pos; },
                         O::G(pos) => { cp = pos; },
@@ -496,4 +562,17 @@ impl<C> RTree<C> {
             }
         }
     }
+}
+
+
+#[test]
+fn test_router() {
+    let mut b = Builder::<String>::new();
+    b.mount(route_expr!("s1", "s2a"), Action::f1(Echo));
+    b.mount(route_expr!("s1", "s3", VarType::Str), Action::f1(Echo));
+    let t = RTree::build(b).unwrap();
+    t.print();
+    println!("{:?}", t.run("/s1/s2a"));
+    println!("{:?}", t.run("/s1/s3/abcde/"));
+
 }

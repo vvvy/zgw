@@ -7,7 +7,7 @@ use std::char;
 #[derive(Copy, Clone, Debug)]
 struct UriEscapeDecoder { p: u32, b: u8, r: u8 }
 
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub enum DErr {
     InvalidHexDigit(u8),
     InvalidUtf8LeaderByte(u8),
@@ -131,33 +131,27 @@ fn test_uri_escape_decoder() {
     );
 }
 
-/// Scanner return value
-#[derive(Debug, Eq, PartialEq)]
-pub enum E { CH(char), ST }
-
 /// Scanner Error
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub enum SErr {
     DErr(DErr),
     Unknown
 }
 
+/// Scanner return value
+#[derive(Debug, Eq, PartialEq)]
+pub enum E { CH(char), ST, ERR(SErr) }
+
 //scanner state
 #[derive(Copy, Clone)]
-enum S { CH, ST, DCH(u8), E(UriEscapeDecoder), E0(UriEscapeDecoder), E1(UriEscapeDecoder), ERR(SErr), END }
+enum S { CH, ST, E(UriEscapeDecoder), E0(UriEscapeDecoder), E1(UriEscapeDecoder),  END }
 
 /// Scans the URI, returning either `E::ST` for exact '/' or `E::CH(char)` for every other char.
-/// '%'-escapes are decoded and returned via `E::CH`. A terminal '/', if any, is stripped.
+/// '%'-escapes are decoded and returned via `E::CH`. A terminal '/', if missing, is inserted.
 pub struct Scanner<'s> { bs: Bytes<'s>, s: S }
 
 impl<'s> Scanner<'s> {
     pub fn new(uri: &'s str) -> Scanner<'s> { Scanner { bs: uri.bytes(), s: S::CH } }
-    pub fn get_error(&self) -> Option<&SErr> {
-        match &self.s {
-            &S::ERR(ref serr) => Some(serr),
-            _ => None
-        }
-    }
 }
 
 macro_rules! return_value(
@@ -174,33 +168,27 @@ impl<'s> Iterator for Scanner<'s> {
     type Item = E;
     fn next(&mut self) -> Option<Self::Item> {
         loop {
-            let smin = match self.s {
-                S::DCH(b) => (S::CH, Some(b)),
-                s => (s, self.bs.next())
-            };
-
-            let (s, rvo) = match smin {
-                (S::CH, Some(b'/')) => (S::ST, cont!()),
-                (S::ST, Some(v))=> (S::DCH(v), return_value!(E::ST)),
+            let (s, rvo) = match (self.s, self.bs.next()) {
+                (S::CH, Some(b'/')) | (S::ST, Some(b'/')) => (S::ST, return_value!(E::ST)),
                 (S::ST, None) => (S::END, return_end!()),
 
-                (S::CH, Some(b'%')) => (S::E0(UriEscapeDecoder::new()), cont!()),
+                (S::CH, Some(b'%')) | (S::ST, Some(b'%')) => (S::E0(UriEscapeDecoder::new()), cont!()),
                 (S::E(d), Some(b'%')) => (S::E0(d), cont!()),
                 (S::E0(d), Some(xd)) => match d.d(xd) {
                     DResult::D(d1) => (S::E1(d1), cont!()),
-                    DResult::Error(derr) => (S::ERR(SErr::DErr(derr)), return_end!()),
-                    _ => (S::ERR(SErr::Unknown), return_end!())
+                    DResult::Error(derr) => (S::END, return_value!(E::ERR(SErr::DErr(derr)))),
+                    _ => (S::END, return_value!(E::ERR(SErr::Unknown)))
                 },
                 (S::E1(d), Some(xd)) => match d.d_shift(xd).try_convert() {
                     DResult::D(d1) => (S::E(d1), cont!()),
-                    DResult::Error(derr) => (S::ERR(SErr::DErr(derr)), return_end!()),
+                    DResult::Error(derr) => (S::END, return_value!(E::ERR(SErr::DErr(derr)))),
                     DResult::Ok(ch) => (S::CH, return_value!(E::CH(ch)))
                 },
-                (S::CH, Some(b)) => (S::CH, return_value!(E::CH(b as char))),
+                (S::CH, Some(b)) | (S::ST, Some(b)) => (S::CH, return_value!(E::CH(b as char))),
+                (S::CH, None) => (S::END, return_value!(E::ST)),
 
                 (S::END, _) => (S::END, return_end!()),
-                (err @ S::ERR(_), _) => (err, return_end!()),
-                _ => (S::ERR(SErr::Unknown), return_end!())
+                _ => (S::END, return_value!(E::ERR(SErr::Unknown)))
             };
             self.s = s;
             if let Some(rv) = rvo { break rv; }
@@ -211,21 +199,22 @@ impl<'s> Iterator for Scanner<'s> {
 #[test]
 fn test_uri_scanner() {
     fn v(p: &str) -> Vec<E> { Scanner::new(p).collect() }
-    assert_eq!(v("/"), vec![]);
-    assert_eq!(v("/a"), vec![E::ST, E::CH('a')]);
-    assert_eq!(v("/a/"), vec![E::ST, E::CH('a')]);
-    assert_eq!(v("/a/b"), vec![E::ST, E::CH('a'), E::ST, E::CH('b')]);
-    assert_eq!(v("/aA/b/"), vec![E::ST, E::CH('a'), E::CH('A'), E::ST, E::CH('b')]);
-    assert_eq!(v("//"), vec![E::ST]);
+    assert_eq!(v("/"), vec![E::ST]);
+    assert_eq!(v("/a"), vec![E::ST, E::CH('a'), E::ST]);
+    assert_eq!(v("/a/"), vec![E::ST, E::CH('a'), E::ST]);
+    assert_eq!(v("/a/b"), vec![E::ST, E::CH('a'), E::ST, E::CH('b'), E::ST]);
+    assert_eq!(v("/aA/b/"), vec![E::ST, E::CH('a'), E::CH('A'), E::ST, E::CH('b'), E::ST]);
+    assert_eq!(v("//"), vec![E::ST, E::ST]);
 
-    assert_eq!(v("/a%20/b/"), vec![E::ST, E::CH('a'), E::CH(' '), E::ST, E::CH('b')]);
-    assert_eq!(v("/a%20_/b/"), vec![E::ST, E::CH('a'), E::CH(' '), E::CH('_'), E::ST, E::CH('b')]);
-    assert_eq!(v("/%20_/b/"), vec![E::ST, E::CH(' '), E::CH('_'), E::ST, E::CH('b')]);
-    assert_eq!(v("/%20%2F_/b/"), vec![E::ST, E::CH(' '), E::CH('/'), E::CH('_'), E::ST, E::CH('b')]);
-    assert_eq!(v("/%2F/b/"), vec![E::ST, E::CH('/'), E::ST, E::CH('b')]);
-    assert_eq!(v("/w%D0%A8/b/"), vec![E::ST, E::CH('w'), E::CH('Ш'), E::ST, E::CH('b')]);
-    assert_eq!(v("/w%D0%A8/"), vec![E::ST, E::CH('w'), E::CH('Ш')]);
-    assert_eq!(v("/w%D0%A8"), vec![E::ST, E::CH('w'), E::CH('Ш')]);
+    assert_eq!(v("/a%20/b/"), vec![E::ST, E::CH('a'), E::CH(' '), E::ST, E::CH('b'), E::ST]);
+    assert_eq!(v("/a%20_/b/"), vec![E::ST, E::CH('a'), E::CH(' '), E::CH('_'), E::ST, E::CH('b'), E::ST]);
+    assert_eq!(v("/%20_/b/"), vec![E::ST, E::CH(' '), E::CH('_'), E::ST, E::CH('b'), E::ST]);
+    assert_eq!(v("/%20%2F_/b/"), vec![E::ST, E::CH(' '), E::CH('/'), E::CH('_'), E::ST, E::CH('b'), E::ST]);
+    assert_eq!(v("/%2F/b/"), vec![E::ST, E::CH('/'), E::ST, E::CH('b'), E::ST]);
+    assert_eq!(v("/w%D0%A8/b/"), vec![E::ST, E::CH('w'), E::CH('Ш'), E::ST, E::CH('b'), E::ST]);
+    assert_eq!(v("/w%D0%A8/"), vec![E::ST, E::CH('w'), E::CH('Ш'), E::ST]);
+    assert_eq!(v("/w%D0%A8"), vec![E::ST, E::CH('w'), E::CH('Ш'), E::ST]);
 
+    assert_eq!(v("s1/s2a"), vec![E::CH('s'), E::CH('1'), E::ST, E::CH('s'), E::CH('2'), E::CH('a'), E::ST]);
 }
 
