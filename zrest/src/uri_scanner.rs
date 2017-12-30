@@ -1,6 +1,9 @@
 use std::str::Bytes;
 use std::char;
 
+use std::error::Error as StdError;
+use std::fmt;
+
 /// Tries to decode an utf-8 uri escape. bytes are added until try succeeds.
 /// p is accumulated code point. b is current byte. r is remaining byte count
 /// see [http://unicode.mayastudios.com/examples/utf8.html]
@@ -24,6 +27,7 @@ enum DResult {
 }
 
 impl DResult {
+    #[cfg(test)]
     fn new() -> DResult { DResult::D(UriEscapeDecoder::new()) }
 
     fn from_option(v: Option<UriEscapeDecoder>, err: DErr) -> Self {
@@ -46,14 +50,13 @@ impl DResult {
         }
     }
 
-    fn d(self, x: u8) -> DResult { self.and_then(|d| d.d(x)) }
+    //fn d(self, x: u8) -> DResult { self.and_then(|d| d.d(x)) }
+    //fn d_shift(self, x: u8) -> DResult { self.d(x).shift() }
+    //fn shift(self) -> DResult { self.and_then(|d| d.shift()) }
 
     fn try_convert(self) -> DResult { self.and_then(|d| d.try_convert()) }
 
-    fn shift(self) -> DResult { self.and_then(|d| d.shift()) }
-
-    fn d_shift(self, x: u8) -> DResult { self.d(x).shift() }
-
+    #[cfg(test)]
     fn to_option(&self) -> Option<char> {
         match self {
             &DResult::Ok(ch) => Some(ch),
@@ -105,7 +108,7 @@ impl UriEscapeDecoder {
         self.d(x).and_then(|v| v.shift())
     }
 
-    #[test]
+    #[cfg(test)]
     fn add_byte(&self, b: u8) -> DResult {
         match b {
             b'_' => self.shift(),
@@ -136,6 +139,38 @@ fn test_uri_escape_decoder() {
 pub enum SErr {
     DErr(DErr),
     Unknown
+}
+
+impl fmt::Display for SErr {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match *self {
+            SErr::DErr(DErr::InvalidHexDigit(v)) => write!(f, "InvalidHexDigit({})", v),
+            SErr::DErr(DErr::InvalidUtf8LeaderByte(v)) => write!(f, "InvalidUtf8LeaderByte({})", v),
+            SErr::DErr(DErr::InvalidUtf8SeqByte(v)) => write!(f, "InvalidUtf8SeqByte({})", v),
+            SErr::DErr(DErr::InvalidShift(v)) => write!(f, "InvalidShift({})", v),
+            SErr::DErr(DErr::InvalidCodepoint(v)) => write!(f, "InvalidCodepoint({})", v),
+            SErr::Unknown => f.write_str("unknown")
+            //ref e => f.write_str(e.description())
+        }
+    }
+}
+
+impl StdError for SErr {
+    fn description(&self) -> &str {
+        match *self {
+            SErr::DErr(DErr::InvalidHexDigit(_)) => "InvalidHexDigit",
+            SErr::DErr(DErr::InvalidUtf8LeaderByte(_)) => "InvalidUtf8LeaderByte",
+            SErr::DErr(DErr::InvalidUtf8SeqByte(_)) => "InvalidUtf8SeqByte",
+            SErr::DErr(DErr::InvalidShift(_)) => "InvalidShift",
+            SErr::DErr(DErr::InvalidCodepoint(_)) => "InvalidCodepoint",
+            SErr::Unknown => "unknown"
+            //ref e => f.write_str(e.description())
+        }
+    }
+
+    fn cause(&self) -> Option<&StdError> {
+        None
+    }
 }
 
 /// Scanner return value

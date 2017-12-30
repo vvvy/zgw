@@ -3,7 +3,6 @@
 use futures::{Future, Stream};
 use tokio_core::reactor::Core;
 
-use hyper;
 use hyper::{Client, Request, Response, Body, StatusCode, Uri, Method};
 use hyper::header::{Authorization, Basic, ContentType};
 use hyper::client::{HttpConnector, FutureResponse};
@@ -53,7 +52,7 @@ pub trait ZClient : CoreH {
 
     // Performs sync POST
     #[inline]
-    fn post<Q, R>(&mut self, uri: Uri, q: &Q, authOpt: &Option<(String, String)>) -> ZRResult<R> where
+    fn post<Q, R>(&mut self, uri: Uri, q: &Q, auth_opt: &Option<(String, String)>) -> ZRResult<R> where
         Q: serde::ser::Serialize,
         R: serde::de::DeserializeOwned {
         let mut req= Request::new(Method::Post, uri);
@@ -63,7 +62,7 @@ pub trait ZClient : CoreH {
         {
             let h = req.headers_mut();
             h.set(ContentType::json());
-            match authOpt {
+            match auth_opt {
                 &Some((ref user, ref pass)) => h.set(
                     Authorization(Basic { username: user.clone(), password: Some(pass.clone()) }
                     )),
