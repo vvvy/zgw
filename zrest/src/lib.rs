@@ -9,9 +9,9 @@ extern crate native_tls;
 extern crate mime;
 
 pub mod client;
-pub mod server;
 mod uri_scanner;
-mod router;
+#[macro_use] pub mod server;
+#[macro_use] mod router;
 
 use std::error::Error as StdError;
 use std::fmt;
@@ -35,7 +35,7 @@ impl fmt::Display for ZRError {
             ZRError::EIO(ref e) => fmt::Display::fmt(e, f),
             ZRError::ESc(ref e) => fmt::Display::fmt(e, f),
             ZRError::EZR(ref s) => fmt::Display::fmt(s, f),
-            ref e => f.write_str(e.description())
+            //ref e => f.write_str(e.description())
         }
     }
 }
@@ -75,7 +75,7 @@ impl StdError for ZRError {
             ZRError::EIO(ref e) => e.description(),
             ZRError::ESc(ref e) => e.description(),
             ZRError::EZR(ref s) => s,
-            _ => "Unknown error"
+            //_ => "Unknown error"
         }
     }
 
@@ -162,7 +162,64 @@ mod client_tests {
 }
 
 
+pub use server::*;
+pub use client::*;
+pub use router::*;
+pub use serde_json::Value as JsValue;
+
+
+
 #[cfg(test)]
 mod server_tests {
-    use server::*;
+    use hyper::server::Http;
+    use hyper::server::{Service, NewService};
+    use futures::sync::oneshot::*;
+    use futures::Future;
+    use ::*;
+
+    #[test]
+    fn test_server() {
+        fn convert_vars(vars: Vec<Val>) -> JsValue {
+            vars.into_iter().map(|val| match val {
+                Val::Str(s) => json!({"str" : s}),
+                Val::Int(i) => json!({"int" : i}),
+                Val::Float(f) => json!({"float" : f}),
+            }).collect()
+        }
+
+        let (snd, recv) = channel::<()>();
+        std::thread::spawn(|| {
+
+            let b = route_builder!(
+                AsyncActionFn<JsValue, JsValue>,
+                "v0/static" => const_action!(Output::Typed(json!({"static":"true", "message": "v0/static"}))),
+                "v0/str/$/a" => no_input_action!(|vars: Vec<Val>| Output::Typed(json!({"op":"a", "type": "str", "vars": convert_vars(vars) }))),
+                "v0/mixed/$i/$f/a" => no_input_action!(|vars: Vec<Val>| Output::Typed(json!({"op":"a", "type": "mixed", "vars": convert_vars(vars) })))
+            );
+
+            let svc = ZService::new(b, Box::new(error_action!("routing failed"))).unwrap();
+
+            let addr = "127.0.0.1:3000".parse().unwrap();
+            let server = Http::new().bind(&addr, to_new_service!(svc)).unwrap();
+            server.run_until(recv.map_err(|_canceled| ()))
+        });
+
+        let mut cl = ZHttpsClient::new(1).unwrap();
+
+        let res = cl.get::<JsValue>("http://127.0.0.1:3000/v0/static".parse().unwrap()).unwrap();
+        assert_eq!(res, json!({"static":"true", "message": "v0/static"}));
+        //println!("SERVER: {:?}", res);
+
+        let res = cl.get::<JsValue>("http://127.0.0.1:3000/v0/str/abcd/a".parse().unwrap()).unwrap();
+        assert_eq!(res, json!({"op":"a", "type": "str", "vars": [{"str" : "abcd"}] }));
+        //println!("SERVER: {:?}", res);
+
+        let res = cl.get::<JsValue>("http://127.0.0.1:3000/v0/mixed/10/0.25/a".parse().unwrap()).unwrap();
+        assert_eq!(res, json!({"op":"a", "type": "mixed", "vars": [{"int" : 10}, {"float" : 0.25}] }));
+        //println!("SERVER: {:?}", res);
+
+        //std::thread::sleep_ms(60000);
+        snd.send(()).unwrap();
+    }
+
 }

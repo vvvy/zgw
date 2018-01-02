@@ -60,18 +60,25 @@ Configuration and CWD (these options are executed immediately once parsed):
 -x|--reset-config                   Reset cfg to default values. May be used to effectively
                                     ignore default config file
 -w|--cd <path>                      chdir <path>
+-u|--username <username>            Set user name for secure URLs following this point in the
+                                    command line (default do no auth)
+-p|--password <password>            Set password for secure URLs following this point in the
+                                    command line. If set to '*', the actual password is read form
+                                    the password file (default '*')
 
 General:
 
 -l|--log-file <filepath>            log file (default stdout if --fg or 'zwaygw.log' otherwise)
 -L|--log-level off|error|warn|info|debug|trace
                                     Set log level
+-g|--device-config-line <cfgline>   Add cfgline to device configuration
 
 Z interface configuration:
 
 -P|--z-files <dirpath>              feed jsons from this dir to zway input (test/debug)
--U|--z-url <urlbase>                use this zway HTTP base url
--S|--z-secure-url <urlbase>         use this zway HTTPS base url
+-U|--z-url <urlbase>                use this zway base url. http, https and file schemes are supported
+                                    (file scheme acts same as in -P option).
+                                    Example: 'http://localhost:8083/ZWaveAPI'
 -d|--z-delay <seconds>              zway polling initial delay (default 0)
 -e|--z-period <seconds>             maximum/default zway polling period (default 60)
 -i|--z-period-min <seconds>         minimum zway polling period (default 5)
@@ -79,8 +86,9 @@ Z interface configuration:
 W interface configuration:
 
 -A|--w-files <ignored>              log all W interface requests
--Q|--w-url <url>                    use this HTTP URL
--X|--w-secure-url <url>             use this HTTPS URL
+-S|--w-url <url>                    use this server URL. http, https and file schemes are supported
+                                    (file scheme acts same as in -A option).
+                                    Example: 'http://10.1.1.1:9999'
 -j|--w-max-send-count <int>         max number of messages per outgoing request (default 64)
 -B|--w-period-long <seconds>        default period between W interface invocations (default 60)
 -b|--w-period-short <seconds>       short period between W interface invocations. Used when there
@@ -90,9 +98,9 @@ W interface configuration:
 
 UNIX only:
 
--f|--fg                         stay in foreground (do not daemonize)
---pid-file <filepath>           PID file path
---chown-pid-file <bool>         whether to chown pid file
+-f|--fg                             stay in foreground (do not daemonize)
+--pid-file <filepath>               PID file path
+--chown-pid-file <bool>             whether to chown pid file
 
 ");
 
@@ -102,6 +110,15 @@ UNIX only:
 fn parse_command_line(cfg: &mut AppConfig) {
     let mut username: Option<String> = None;
     let mut password = "*".to_owned();
+
+    fn process_url(a: String, username: &Option<String>, password: &String)
+        -> std::result::Result<SD, String>
+    {
+        if a.starts_with("http://") { Ok(SD::URL(a)) }
+        else if a.starts_with("https://") { Ok(SD::SURL(a, Creds::new_opt(username, password))) }
+        else if a.starts_with("file:") { Ok(SD::Files((&a[5..]).to_owned())) }
+        else { Err(format!("invalid url `{}`", a)) }
+    };
 
     match std::env::args().skip(1).flat_map(convert_arg).fold(None, |s, a| match s {
         None => match a.as_ref() {
@@ -119,14 +136,12 @@ fn parse_command_line(cfg: &mut AppConfig) {
                 "-l"|"--log-file" => cfg.g.log_file = Some(PathBuf::from(a)),
                 "-L"|"--log-level" => cfg.g.log_level = a,
                 "-P"|"--z-files" => cfg.z.sd = SD::Files(a),
-                "-U"|"--z-url" => cfg.z.sd = SD::URL(a),
-                "-S"|"--z-secure-url" => { cfg.z.sd = SD::SURL(a, Creds::new_opt(&username, &password)) },
+                "-U"|"--z-url" => cfg.z.sd = process_url(a, &username, &password).expect("Invalid Z URL"),
                 "-d"|"--z-delay" => cfg.z.delay_s = a.parse().expect("expected an int to `--z-delay`"),
                 "-e"|"--z-period" => cfg.z.period_max_s = a.parse().expect("expected an int to `--z-period`"),
                 "-i"|"--z-period-min" => cfg.z.period_min_s = a.parse().expect("expected an int to `--z-period-min`"),
                 "-A"|"--w-files" => cfg.w.sd = SD::Files(a),
-                "-Q"|"--w-url" => cfg.w.sd = SD::URL(a),
-                "-X"|"--w-secure-url" => { cfg.w.sd = SD::SURL(a, Creds::new_opt(&username, &password)) },
+                "-S"|"--w-url" => cfg.w.sd = process_url(a, &username, &password).expect("Invalid W URL"),
                 "-j"|"--w-max-send-count" => cfg.w.max_send_count = a.parse().expect("expected unsigned int to --w-max-send-count"),
                 "-B"|"--w-period-long"  => cfg.w.period_long_s = a.parse().expect("expected unsigned int to --w-period-long"),
                 "-b"|"--w-period-short"  => cfg.w.period_short_s = a.parse().expect("expected unsigned int to --w-period-short"),

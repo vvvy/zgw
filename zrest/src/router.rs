@@ -28,11 +28,49 @@ pub enum VarType {
 /// Method + content-type of incoming data, if any
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum MCT {
-    GET,
-    POST(Mime),
-    PUT(Mime),
-    DELETE
+    Get,
+    PostJson,
+    Post(Mime),
+    PutJson,
+    Put(Mime),
+    Delete,
+    Other
 }
+
+pub enum MCTR<'t> {
+    Get,
+    Post(&'t Mime),
+    Put(&'t Mime),
+    Delete,
+    Other
+}
+use std::str::FromStr;
+impl MCT {
+    fn matches<'t>(&self, other: &MCTR<'t>) -> bool {
+        fn matches_json(mct: &Mime) -> bool {
+            match (mct.type_(), mct.subtype(), mct.get_param(mime::CHARSET)) {
+                (mime::APPLICATION, mime::JSON, Some(mime::UTF_8)) => true,
+                (mime::APPLICATION, mime::JSON, None) => true,
+                _ => false
+            }
+        }
+        match (self, other) {
+            (&MCT::Get, &MCTR::Get) | (&MCT::Delete, &MCTR::Delete) | (&MCT::Other, &MCTR::Other) =>
+                true,
+            (&MCT::PostJson, &MCTR::Post(ref rmime)) =>
+                matches_json(*rmime),
+            (&MCT::PutJson, &MCTR::Put(ref rmime)) =>
+                matches_json(*rmime),
+            (&MCT::Post(ref lmime), &MCTR::Post(ref rmime)) =>
+                *lmime == **rmime,
+            (&MCT::Put(ref lmime), &MCTR::Put(ref rmime)) =>
+                *lmime == **rmime,
+            _ => false
+        }
+
+    }
+}
+
 
 /// Condition for branching in the tree
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
@@ -143,7 +181,7 @@ macro_rules! route_expr(
 );
 
 impl<A: Debug> Builder<A> {
-    fn print(&self) {
+    pub fn print(&self) {
         use std::iter::FromIterator;
         fn line<A>(n: &BNode<A>, depth: usize) where A: Debug {
             let head = format!("{}",
@@ -163,6 +201,14 @@ impl<A: Debug> Builder<A> {
 
 impl<A> Builder<A> {
     pub fn new() -> Builder<A> { Builder { root: BNode::new() } }
+
+    pub fn from_vec(router_table: Vec<(Vec<Condition>, A)>) -> Builder<A> {
+        let mut b = Builder::new();
+        for (cond, a) in router_table {
+            b.mount(cond, a)
+        }
+        b
+    }
 
     pub fn mount(&mut self, condition: Vec<Condition>, a: A) {
         fn step<'t, A: 't>(n: &'t mut BNode<A>, condition: &[Condition], a: A) {
@@ -425,7 +471,7 @@ pub struct RTree<A> {
 }
 
 impl<A> RTree<A> where A: Debug {
-    fn print(&self)  {
+    pub fn print(&self)  {
         for (pos, n) in self.tree.iter().enumerate() {
             print!("{}[{:#03}]  ", if pos == self.init { "*" } else { " " }, pos);
             match n {
@@ -489,7 +535,7 @@ impl<A> RTree<A> {
         Ok(RTree { tree: tree, init: label_table.materialize(entry)? })
     }
 
-    pub fn run<'t, 'q>(&'t self, s: &'q str) -> ZRResult<(&'t A, Vec<Val>)> {
+    pub fn run<'t, 'q>(&'t self, s: &'q str, mct_a: MCTR<'q>) -> ZRResult<(&'t A, Vec<Val>)> {
         let mut sc = Scanner::new(&s);
 
         enum O {
@@ -528,6 +574,8 @@ impl<A> RTree<A> {
                                 Err(_) => { O::SG(b_failure) },
                             }
                         },
+                        (_, &RCond::MCT(ref mct)) =>
+                            if MCT::matches(mct, &mct_a) { O::G(b_success) } else { O::G(b_failure) },
                         _ => O::G(b_failure)
                     };
                     match res {
@@ -556,6 +604,25 @@ pub fn parse_uri_pattern(pattern: &str) -> Vec<Condition> {
     ).collect()
 }
 
+//-------------------------------------------------------------------------------------------------
+
+#[macro_export]
+macro_rules! route(
+    { $($cond:expr),* => $act:expr } => {
+        (vec![$(::router::Condition::from($cond)),*], $act)
+    };
+);
+
+
+#[macro_export]
+macro_rules! route_builder(
+    { $t:ty, $($pat:expr => $act:expr),+ } => { {
+        let mut b = ::router::Builder::<$t>::new();
+        $(b.mount(::router::parse_uri_pattern($pat), Box::new($act));)+
+        b
+        } }
+);
+
 
 ///-------------------------------------------------------------------------------------------------
 /// this solely exists for the tests to work.
@@ -582,7 +649,7 @@ macro_rules! s(
 #[cfg(test)]
 macro_rules! check_route(
     { $tree:expr, $input:expr => $result:expr, [ $($var:expr),* ] } => {
-        assert_eq!(($tree).run($input).unwrap(), (&s!($result), vec![$(Val::Str(s!($var)),)*]));
+        assert_eq!(($tree).run($input, MCTR::Get).unwrap(), (&s!($result), vec![$(Val::Str(s!($var)),)*]));
     };
 );
 
@@ -608,5 +675,5 @@ fn test_router_b() {
     check_route!(t, "/v1/user/abcde/data" => "<user+$+data>", ["abcde"]);
     check_route!(t, "/v1/user/" => "<user>", []);
     check_route!(t, "/v1/user/abcde" => "<user+$>", ["abcde"]);
-    assert_eq!(t.run("/v1/n/123/s/zaq").unwrap(), (&s!("<n+$+$>"), vec![Val::Int(123), Val::Str(s!("zaq"))]));
+    assert_eq!(t.run("/v1/n/123/s/zaq", MCTR::Get).unwrap(), (&s!("<n+$+$>"), vec![Val::Int(123), Val::Str(s!("zaq"))]));
 }

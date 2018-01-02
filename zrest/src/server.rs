@@ -3,11 +3,10 @@ use futures::future;
 //use tokio_core::reactor::Core;
 
 use hyper;
-use hyper::{Request, Response, Body, Chunk, StatusCode, Uri, Method};
+use hyper::{Request, Response, Chunk, StatusCode, Method};
 use hyper::error::Error;
-use hyper::server::NewService;
 use hyper::header::{/*Authorization, Basic,*/ ContentType, ContentLength, Server};
-use hyper::server::{Http, Service};
+use hyper::server::{/*Http,*/ Service};
 use hyper::mime;
 
 use serde_json;
@@ -56,11 +55,13 @@ pub enum Output<R:Ser> {
     Error(ZRError)
 }
 //--------------------------------------------------------------------------------------------------
+type OutputGenerator<Q, R> = Box<Fn(Vec<Val>, Input<Q>) -> Box<Future<Item=Output<R>, Error=Error>>>;
 
 fn process_input<Q, R>(
     req: Request,
     it: InputType,
-    hx: Box<Fn(Input<Q>) -> Box<Future<Item=Output<R>, Error=Error>>>)
+    vars: Vec<Val>,
+    hx: OutputGenerator<Q,R>)
     -> Box<Future<Item=Output<R>, Error=Error>>
     where
         Q: Des + 'static,
@@ -121,7 +122,6 @@ fn process_input<Q, R>(
                     ).flatten()
                 ),
             InputType::Ignore =>
-            //TODO stop chunk (?)
                 Box::new(future::ok(Input::Empty))
         };
 
@@ -129,7 +129,7 @@ fn process_input<Q, R>(
         //verbatim copy an input error; run any other input through hx
         match i {
             Input::Error(e) => Box::new(future::ok(Output::Error(e))),
-            oth => hx(oth)
+            oth => hx(vars, oth)
         }
     );
 
@@ -149,6 +149,25 @@ fn generate_output<R>(output_i: Box<Future<Item=Output<R>, Error=Error>>)
     where
         R: Ser + 'static + From<ZRError>
 {
+     fn as_json_err<'r, R: Ser + 'r + From<ZRError>>(err: ZRError) -> Response {
+         match serde_json::to_vec(&(R::from(err))) {
+             Ok(b) => resp_stub()
+                 .with_status(StatusCode::BadRequest)
+                 .with_header(ContentType::json())
+                 .with_header(ContentLength(b.len() as u64))
+                 .with_body(b),
+             Err(e) => {
+                 // Should rarely or never happen
+                 let s = format!("Error encoding JSON serilalizer error: {}", e);
+                 resp_stub()
+                     .with_status(StatusCode::InternalServerError)
+                     .with_header(ContentType::plaintext())
+                     .with_header(ContentLength(s.len() as u64))
+                     .with_body(s)
+             }
+         }
+     }
+
      fn as_json<'r, T: Ser, R: Ser + 'r + From<ZRError>>(rv: &T) -> Response {
         match serde_json::to_vec(&rv) {
             Ok(b) => resp_stub()
@@ -156,22 +175,7 @@ fn generate_output<R>(output_i: Box<Future<Item=Output<R>, Error=Error>>)
                 .with_header(ContentLength(b.len() as u64))
                 .with_body(b),
             Err(e) =>   // encoding failed
-                match serde_json::to_vec(&(R::from(ZRError::from(e)))) {
-                    Ok(b) => resp_stub()
-                        .with_status(StatusCode::InternalServerError)
-                        .with_header(ContentType::json())
-                        .with_header(ContentLength(b.len() as u64))
-                        .with_body(b),
-                    Err(e) => {
-                        // Should rarely or never happen
-                        let s = format!("Error encoding JSON serilalizer error: {}", e);
-                        resp_stub()
-                            .with_status(StatusCode::InternalServerError)
-                            .with_header(ContentType::plaintext())
-                            .with_header(ContentLength(s.len() as u64))
-                            .with_body(s)
-                    }
-                }
+                as_json_err::<R>(ZRError::from(e))
         }
     }
 
@@ -188,7 +192,9 @@ fn generate_output<R>(output_i: Box<Future<Item=Output<R>, Error=Error>>)
                     .with_header(ContentType(ct))
                     .with_header(ContentLength(b.len() as u64))
                     .with_body(b),
-            // TODO process Error
+            Output::Error(e) =>
+                as_json_err::<R>(e),
+            //TODO file
             _ =>
                 resp_stub().with_status(StatusCode::NotImplemented)
         });
@@ -199,15 +205,15 @@ fn generate_output<R>(output_i: Box<Future<Item=Output<R>, Error=Error>>)
 //--------------------------------------------------------------------------------------------------
 
 //pub type AsyncActionFn<'t, Q, R> = Box<Fn() -> AsyncPreResult<Q, R> + 't>;
-pub type AsyncActionFn<'t, Q, R> = Box<Fn(Vec<Val>, Option<u64>) -> AsyncResult<Q, R> + 't>;
-pub type AsyncResult<Q, R> = (InputType, Box<Fn(Input<Q>) -> Box<Future<Item=Output<R>, Error=Error>>>);
+pub type AsyncActionFn<'t, Q, R> = Box<Fn(&Vec<Val>, Option<u64>) -> AsyncResult<Q, R> + 't>;
+pub type AsyncResult<Q, R> = (InputType, OutputGenerator<Q, R>);
 
-trait AsyncA<Q, R> where Q: Des, R:Ser {
-    fn apply(&self, vars: Vec<Val>, content_length: Option<u64>)-> AsyncResult<Q, R>;
+trait AsyncAction<Q, R> where Q: Des, R:Ser {
+    fn apply(&self, vars: &Vec<Val>, content_length: Option<u64>)-> AsyncResult<Q, R>;
 }
 
-impl<'t, Q, R> AsyncA<Q, R> for AsyncActionFn<'t, Q, R> where Q: Des, R:Ser {
-    fn apply(&self, vars: Vec<Val>, content_length: Option<u64>) -> AsyncResult<Q, R> {
+impl<'t, Q, R> AsyncAction<Q, R> for AsyncActionFn<'t, Q, R> where Q: Des, R:Ser {
+    fn apply(&self, vars: &Vec<Val>, content_length: Option<u64>) -> AsyncResult<Q, R> {
         (*self)(vars, content_length)
     }
 }
@@ -215,7 +221,7 @@ impl<'t, Q, R> AsyncA<Q, R> for AsyncActionFn<'t, Q, R> where Q: Des, R:Ser {
 //--------------------------------------------------------------------------------------------------
 
 fn exec_action<'t, Q, R>(
-    f: &'t AsyncA<Q, R>,
+    f: &'t AsyncAction<Q, R>,
     req: Request,
     vars: Vec<Val>
 ) -> Box<Future<Item=Response, Error=Error>>
@@ -223,46 +229,26 @@ where
     Q: Des + 'static,
     R: Ser + 'static + From<ZRError>
 {
-    let (it, hx) = f.apply(vars, req.headers().get::<ContentLength>().map(|h| **h));
-    let o_t = process_input(req, it,hx);
+    let (it, hx) = f.apply(&vars, req.headers().get::<ContentLength>().map(|h| **h));
+    let o_t = process_input(req, it,vars, hx);
     let result = generate_output(o_t);
     result
 }
 
 //--------------------------------------------------------------------------------------------------
-
-pub fn success<'t, Q, R>() -> AsyncActionFn<'t, Q, R> where
-    Q: Des + 'static,
-    R: Ser + 'static //+ From<serde_json::Error>
-{
-    Box::new(|_, _| (
-        InputType::Empty,
-        Box::new(|_|
-            Box::new(future::ok::<Output<R>, Error>(Output::Empty)))
-    ))
+/// error wrapper
+#[derive(Serialize)]
+pub struct EW {
+    message: String,
+    detail: String
 }
-
-/*
-pub fn constant<'t, Q, R>(v: Output<R>) -> AsyncActionFn<'t, Q, R> where
-    Q: Des + 'static,
-    R: Ser + 'static, //+ From<serde_json::Error>
-{
-    Box::new(move |_, _| (
-        InputType::Ignore,
-        Box::new(move |_|
-            Box::new(future::ok::<Output<R>, Error>(v))
-        )
-    ))
-}
-*/
-//--------------------------------------------------------------------------------------------------
 
 /// a very basic generic output wrapper
 #[derive(Serialize)]
 pub struct GOW<T> where T: Ser {
     ok: bool,
     data: Option<T>,
-    message: Option<String>
+    error: Option<EW>
 }
 
 impl<T> GOW<T> where T: Ser {
@@ -270,36 +256,44 @@ impl<T> GOW<T> where T: Ser {
         GOW {
             ok: true,
             data: Some(t),
-            message: None
+            error: None
+        }
+    }
+
+    pub fn error(e: &ZRError) -> GOW<T> {
+        GOW {
+            ok: false,
+            data: None,
+            error: Some(EW { message: e.description().to_owned(), detail: format!("{}", e) })
         }
     }
 }
 
 impl<T> From<ZRError> for GOW<T> where T: Ser {
-    fn from(e: ZRError) -> Self {
-        GOW {
-            ok: false,
-            data: None,
-            // TODO: make this up
-            message: Some("<ZRError>".to_string())  //format!("{}", e)
-        }
-    }
+    fn from(e: ZRError) -> Self { GOW::error(&e) }
 }
 
+impl<'t, T> From<&'t ZRError> for GOW<T> where T: Ser {
+    fn from(e: &'t ZRError) -> Self { GOW::error(e) }
+}
 //--------------------------------------------------------------------------------------------------
 pub struct ZService<'t, Q, R> where Q: Des + 'static, R: Ser + 'static {
     rt: RTree<AsyncActionFn<'t, Q, R>>
 }
 
-impl<'t, Q, R> ZService<'t, Q, R> where Q: Des, R: Ser {
-    pub fn new(router_table: Vec<(Vec<Condition>, AsyncActionFn<'t, Q, R>)>,
-               failure_action: AsyncActionFn<'t, Q, R>) -> ZRResult<Self>
+impl<'t, Q, R> ZService<'t, Q, R> where Q: Des, R: Ser + From<ZRError> {
+    pub fn new(builder: Builder<AsyncActionFn<'t, Q, R>>,
+               failure_action: AsyncActionFn<'t, Q, R>)
+        -> Result<Self, std::io::Error>
     {
-        let mut b = Builder::new();
-        for (cond, a) in router_table {
-            b.mount(cond, a)
-        }
-        Ok(ZService { rt: RTree::build(b, failure_action)? })
+        RTree::build(builder, failure_action)
+            .map(|t| ZService { rt: t })
+            .map_err(|e|
+                match e {
+                    ZRError::EIO(io) => io,
+                    e => std::io::Error::new(std::io::ErrorKind::Other, e)
+                }
+            )
     }
 }
 
@@ -313,47 +307,68 @@ impl<'t, Q, R> Service for ZService<'t, Q, R> where
     type Future = Box<Future<Item=Self::Response, Error=Self::Error>>;
 
     fn call(&self, req: Request) -> Self::Future {
-        // TODO: fix unwrap
-        let (rh, vars) = self.rt.run(req.uri().path()).unwrap();
-        exec_action(rh, req, vars)
+        let r = {
+            let mct = {
+                let ct = match req.headers().get::<ContentType>() {
+                    Some(&ContentType(ref rmime)) => rmime,
+                    None => &mime::APPLICATION_JSON
+                };
+
+                match req.method() {
+                    &Method::Get => MCTR::Get,
+                    &Method::Post => MCTR::Post(ct),
+                    &Method::Put => MCTR::Put(ct),
+                    &Method::Delete => MCTR::Delete,
+                    _ => MCTR::Other
+                }
+            };
+            self.rt.run(req.uri().path(), mct)
+        };
+
+        match r {
+            Ok((rh, vars)) => exec_action(rh, req, vars),
+            Err(e) => generate_output::<R>(Box::new(future::ok(Output::Error(e))))
+        }
     }
 }
 
-/*
-pub type ZServiceGen<'t, Q, R> = Fn() -> () where Q: Des, R: Ser  {
-    fn generate() -> Vec<(Vec<Condition>, AsyncActionFn<'t, Q, R>)>;
-    fn failure_action() -> AsyncActionFn<'t, Q, R>
-}*/
-
-
 impl From<ZRError> for JsValue {
     fn from(e: ZRError) -> Self {
-        //TODO: make this up
-        json!({"status":"error", "message": "<ZRERR>"})
+        json!({
+            "ok": false,
+            "error": {
+                "message": e.description().to_owned(),
+                "detail": format!("{}", e)
+            }
+        })
     }
 }
 
 //type UntypedZServer = ZServer<'static, 'static, JsValue, JsValue>;
 
 #[macro_export]
-macro_rules! route(
-    { $($cond:expr),* => $act:expr } => {
-        (vec![$(Condition::from($cond)),*], $act)
-    };
+macro_rules! to_new_service(
+    { $z:expr } => { {
+        let svc = std::sync::Arc::new($z);
+        move || Ok(svc.clone())
+    } }
 );
 
+#[macro_export]
+macro_rules! const_action(
+    { $c:expr } => { |_, _| (::server::InputType::Ignore, Box::new(|_, _| Box::new(::futures::future::ok($c)))) }
+);
 
+macro_rules! no_input_action(
+    { $c:expr } => { |_, _| (::server::InputType::Ignore, Box::new(|vars, _| Box::new(::futures::future::ok($c(vars))))) }
+);
 
-#[test]
-fn test_server() {
+#[macro_export]
+macro_rules! empty_action(
+    { } => { const_action!(::server::Output::Empty) }
+);
 
-    let addr = "127.0.0.1:3000".parse().unwrap();
-    let server = Http::new().bind(&addr, || {
-        let v = vec![
-            route!("a" , "b" => success::<JsValue, JsValue>())
-        ];
-
-        Ok(ZService::new(v, success::<JsValue, JsValue>()).unwrap())
-    }).unwrap();
-    //server.run().unwrap();
-}
+#[macro_export]
+macro_rules! error_action(
+    { $s:expr } => { const_action!(::server::Output::Error(ZRError::EZR($s.to_owned()))) }
+);

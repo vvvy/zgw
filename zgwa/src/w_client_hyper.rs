@@ -2,7 +2,6 @@ extern crate hyper;
 
 use self::hyper::Client;
 use self::hyper::status::StatusCode;
-//use self::hyper::method::Method;
 use self::hyper::client::response::Response;
 use self::hyper::client::RequestBuilder;
 use self::hyper::header::{Authorization, Basic};

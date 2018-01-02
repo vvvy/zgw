@@ -3,8 +3,8 @@
 use futures::{Future, Stream};
 use tokio_core::reactor::Core;
 
-use hyper::{Client, Request, Response, Body, StatusCode, Uri, Method};
-use hyper::header::{Authorization, Basic, ContentType};
+use hyper::{Client, Request, Body, Uri, Method};
+use hyper::header::{Authorization, Basic, ContentType, ContentLength};
 use hyper::client::{HttpConnector, FutureResponse};
 use hyper_tls::HttpsConnector;
 use serde;
@@ -20,10 +20,12 @@ pub trait CoreH {
             fr
                 .map_err(
                     |e| ZRError::from(e)
-                ).and_then(
-                |res| if res.headers().get::<ContentType>() != Some(&ContentType::json())
-                    { Ok(res) }
-                    else { Err(ZRError::EZR("invalid content type".to_string())) }
+                ).and_then(|res|
+                    match res.headers().get::<ContentType>() {
+                        Some(rct) if rct.type_() == mime::APPLICATION && rct.subtype() == mime::JSON => Ok(()),
+                        Some(rct) => Err(ZRError::EZR(format!("invalid content type `{}`", *rct))),
+                        None => Err(ZRError::EZR(format!("no content type found (application/json required)")))
+                    } .map(|_| res)
                 ).and_then(|res|
                     res.body()
                         .concat2()
@@ -57,11 +59,13 @@ pub trait ZClient : CoreH {
         R: serde::de::DeserializeOwned {
         let mut req= Request::new(Method::Post, uri);
         let data =  serde_json::to_vec(q)?;
+        let dlen = data.len();
         let body: Body = data.into();
         req.set_body(body);
         {
             let h = req.headers_mut();
             h.set(ContentType::json());
+            h.set(ContentLength(dlen as u64));
             match auth_opt {
                 &Some((ref user, ref pass)) => h.set(
                     Authorization(Basic { username: user.clone(), password: Some(pass.clone()) }
