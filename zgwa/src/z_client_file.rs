@@ -16,7 +16,7 @@ impl FileZClient {
 impl ZClient for FileZClient {
     fn collect_updates(&self, ts: u32, sk: &mut ZNotificationTarget) -> Result<()> {
         File::open(format!("{}/{}.json", self.path, ts)).map_err(
-            |e| format!("FileConnector: I/O error: {}", e)
+            |e| ::Error::io("FileConnector", e)
         ).and_then(
             |mut f| sk.push(&mut f)
         )

@@ -59,7 +59,7 @@ General:
 
 -l|--log-file <filepath>            log file (default stdout if --fg or 'zwaygw.log' otherwise)
 -L|--log-level off|error|warn|info|debug|trace
-                                    Set log level
+                                    Set log level (default info)
 
 UW Server options:
 
@@ -71,9 +71,9 @@ UW Server options:
 
 UNIX only:
 
--f|--fg                         stay in foreground (do not daemonize)
---pid-file <filepath>           PID file path
---chown-pid-file <bool>         whether to chown pid file
+-f|--fg                             stay in foreground (do not daemonize)
+--pid-file <filepath>               PID file path
+--chown-pid-file <bool>             whether to chown pid file
 
 ");
 
@@ -81,7 +81,7 @@ UNIX only:
 }
 
 fn parse_command_line(cfg: &mut AppConfig) {
-    match std::env::args().skip(1).flat_map(convert_arg).fold(None, |s, a| match s {
+    parse_cmdln(|s, a| match s {
         None => match a.as_ref() {
             "-f"|"--fg" => { cfg.g.daemonize = false; None },
             "-x"|"--reset-config" => { *cfg = AppConfig::default(); None},
@@ -91,29 +91,25 @@ fn parse_command_line(cfg: &mut AppConfig) {
         },
         Some(ref a0) => {
             match a0.as_ref() {
-                "-C"|"--config-file" => *cfg = read_config(&a).expect("unable to read config file"),
+                "-C"|"--config-file" => *cfg = read_config(&a).expect2("unable to read config file"),
                 "-W"|"--write-config-file" => save_config_file(&a, &cfg),
-                "-w"|"--cd" => std::env::set_current_dir(PathBuf::from(a)).expect("unable to cd"),
+                "-w"|"--cd" => std::env::set_current_dir(PathBuf::from(a)).expect2("unable to cd"),
                 "-l"|"--log-file" => cfg.g.log_file = Some(PathBuf::from(a)),
                 "-L"|"--log-level" => cfg.g.log_level = a,
                 "-r"|"--server-hostport" => cfg.u.hostport = a,
-                "--r-n-logfiles" => cfg.u.n_logs = a.parse().expect("expected an int to --r-n-logfiles"),
-                "--r-records-per-logfile" => cfg.u.records_per_logfile = a.parse().expect("expected an int to --records-per-logfile"),
+                "--r-n-logfiles" => cfg.u.n_logs = a.parse().expect2("expected an int to --r-n-logfiles"),
+                "--r-records-per-logfile" => cfg.u.records_per_logfile = a.parse().expect2("expected an int to --records-per-logfile"),
                 "--r-dir" => cfg.u.report_dir = Some(PathBuf::from(a)),
                 "--pid-file" => cfg.d.pid_file = Some(a),
                 "--chown-pid-file" => cfg.d.chown_pid_file = Some(bool_opt(a)),
                 "--daemon-user" => cfg.d.user = Some(a),
                 "--daemon-group" => cfg.d.group = Some(a),
-                "--daemon-group-n" => cfg.d.group_n = Some(a.parse().expect("expected unsigned int to --daemon-group-n")),
-                _ => panic!("Invalid cmd line at `{} {}`", a0, a)
+                "--daemon-group-n" => cfg.d.group_n = Some(a.parse().expect2("expected unsigned int to --daemon-group-n")),
+                _ => error_exit(&format!("Invalid cmd line at `{} {}`", a0, a), "unknown option")
             };
             None
         }
-    }) {
-        None => (),
-        Some(ref e) => panic!("Invalid cmd line at `{}`<EOL>", e)
-    }
-
+    })
 }
 
 

@@ -4,6 +4,7 @@ use std::mem::swap;
 use std::fmt;
 use std::cmp::{min, max};
 use std::str::FromStr;
+use ::*;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum NodeValue {
@@ -39,29 +40,29 @@ impl fmt::Display for NodeValue {
 }
 
 impl NodeValue {
-    pub fn from_strings(k: &str, v: String) -> Result<NodeValue, String> {
+    pub fn from_strings(k: &str, v: String) -> Result<NodeValue> {
         if k == "String" { Ok(NodeValue::String(v)) }
-            else if k == "Float" { v.parse().map(|v| NodeValue::Float(v)).map_err(|e| format!("Float parse: {}", e)) }
-                else if k == "Int" { v.parse().map(|v| NodeValue::Int(v)).map_err(|e| format!("Int parse: {}", e)) }
+            else if k == "Float" { v.parse().map(|v| NodeValue::Float(v)).map_err(|e| ::Error::other("float parse", e)) }
+                else if k == "Int" { v.parse().map(|v| NodeValue::Int(v)).map_err(|e| ::Error::other("int parse", e)) }
                     else if k == "Bool" {
                         if v == "true" { Ok(NodeValue::Bool(true)) }
                             else if v == "false" { Ok(NodeValue::Bool(false)) }
-                                else { Err(format!("Bool parse: invalid constant `{}`", v))}
+                                else { Err(::Error::gen(&format!("Bool parse: invalid constant `{}`", v))) }
                     }
                         //TODO: StringArray, IntArray, Binary
-                        else { Err(format!("Invalid NV: k={}, v={}", k, v)) }
+                        else { Err(::Error::gen(&format!("Invalid NV: k={}, v={}", k, v))) }
     }
 
-    pub fn from_string(k: &str) -> Result<NodeValue, String> {
+    pub fn from_string(k: &str) -> Result<NodeValue> {
         if k == "Null" { Ok(NodeValue::Null) }
-            else { Err(format!("Invalid NV: k={}", k)) }
+            else { Err(::Error::gen(&format!("Invalid NV: k={}", k))) }
     }
 }
 
 impl FromStr for NodeValue {
-    type Err = String;
+    type Err = ::Error;
 
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
+    fn from_str(s: &str) -> Result<Self> {
         let it = s.chars();
 
         enum S {
@@ -89,18 +90,26 @@ impl FromStr for NodeValue {
         ) {
             S::R(k, v) => NodeValue::from_strings(&k, v),
             S::K(k) => NodeValue::from_string(&k),
-            _ => Err("Invalid NV format".to_string())
+            _ => Err(::Error::gen("Invalid NV format"))
         }
     }
 }
 
 #[test]
 fn test_parse_nv() {
-    assert_eq!(Ok(NodeValue::Bool(true)), "Bool(true)".parse::<NodeValue>());
-    assert_eq!(Ok(NodeValue::Int(101)), "Int(101)".parse::<NodeValue>());
-    assert_eq!(Ok(NodeValue::Float(10.2)), "Float(10.2)".parse::<NodeValue>());
-    assert_eq!(Ok(NodeValue::String("sx".to_string())), "String(sx)".parse::<NodeValue>());
-    assert_eq!(Ok(NodeValue::Null), "Null".parse::<NodeValue>());
+    macro_rules! bust_err {
+        { $e:expr } => { $e.map_err(|_: Error| ()) }
+    }
+
+    macro_rules! assert_eq_be {
+        { $e1:expr, $e2:expr } => { assert_eq!(bust_err!($e1), bust_err!($e2)) }
+    }
+
+    assert_eq_be!(Ok(NodeValue::Bool(true)), "Bool(true)".parse::<NodeValue>());
+    assert_eq_be!(Ok(NodeValue::Int(101)), "Int(101)".parse::<NodeValue>());
+    assert_eq_be!(Ok(NodeValue::Float(10.2)), "Float(10.2)".parse::<NodeValue>());
+    assert_eq_be!(Ok(NodeValue::String("sx".to_string())), "String(sx)".parse::<NodeValue>());
+    assert_eq_be!(Ok(NodeValue::Null), "Null".parse::<NodeValue>());
     assert!("Float".parse::<NodeValue>().is_err());
     assert!("Float(".parse::<NodeValue>().is_err());
     assert!("Float()".parse::<NodeValue>().is_err());

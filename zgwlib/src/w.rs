@@ -55,7 +55,7 @@ impl Target<NetUpdate> for Sender<WCmd> {
         for NetUpdate(l, tnv) in d {
             match self.send(WCmd::NetUpdate(l, tnv)) {
                 Ok(_) => (),
-                Err(_) => return Err("feed failed (Disconnect)".to_string())
+                Err(_) => return Err(::Error::gen("feed failed (Disconnect)"))
             }
         }
         Ok(())
@@ -80,7 +80,7 @@ impl Target<UserUpdate> for Sender<WCmd> {
             };
             match self.send(wcmd) {
                 Ok(_) => (),
-                Err(_) => return Err("feed failed (Disconnect)".to_string())
+                Err(_) => return Err(::Error::gen("feed failed (Disconnect)"))
             }
         }
         Ok(())
@@ -114,7 +114,7 @@ impl Target<NetUpdate> for Sender<UWEvt> {
             )
         };
 
-        st.map_err(|e| format!("feed failed (Disconnect): {}", e))
+        st.map_err(|e| ::Error::other("feed failed (Disconnect)", e))
     }
 }
 

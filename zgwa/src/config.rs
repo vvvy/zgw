@@ -5,7 +5,7 @@ use zgwlib::config::{GenOptions, DaemonizeOptions};
 use nvimpl::*;
 pub use nvimpl::DeviceConfig;
 use nv::OperationTarget;
-use Result;
+use ::*;
 
 #[derive(Serialize, Deserialize)]
 pub struct AppConfig {
@@ -95,18 +95,18 @@ fn parse_optarget(s: &str) -> Result<OperationTarget> {
     let air: Result<Vec<u8>> = s
         .split(',')
         .map(|s| s.trim())
-        .map(|s| s.parse().map_err(|e| format!("Unable to convert `{}` to number: {}", s, e)))
+        .map(|s| s.parse().map_err(|e| Error::other(&format!("Unable to convert `{}` to number", s), e)))
         .collect()
     ;
 
     air
-        .and_then(|a| match a.len() { 3 => Ok(a), n => Err(format!("OT: invalid #of args: {} (3 reqd)", n))})
+        .and_then(|a| match a.len() { 3 => Ok(a), n => Err(Error::gen(&format!("OT: invalid #of args: {} (3 reqd)", n)))})
         .map(|a| OperationTarget::new(a[0], a[1], a[2]))
 }
 
 fn parse_command<'s>(k: Vec<&'s str>, v: Vec<&'s str>) -> Result<ConfigCommand> {
     if k.is_empty() {
-        return Err("Invalid command (empty key)".to_owned());
+        return Err(Error::gen("Invalid command (empty key)"));
     }
     match (k[0], k.len() - 1, &k[1..], v.len()) {
         ("state", 1, sname, vl) if vl > 0 => {
@@ -117,7 +117,7 @@ fn parse_command<'s>(k: Vec<&'s str>, v: Vec<&'s str>) -> Result<ConfigCommand> 
                         "readonly" => Ok(UpdaterT::Readonly),
                         "thermostat-setpoint-heating" => Ok(UpdaterT::ThermostatSetpointHeating),
                         "switch-binary" => Ok(UpdaterT::SwitchBinary),
-                        v => Err(format!("Unknown updater-typespec `{}`", v))
+                        v => Err(Error::gen(&format!("Unknown updater-typespec `{}`", v)))
                     };
 
                     tp.and_then(|t| parse_optarget(tp_otr[1]).map(|o|
@@ -125,7 +125,7 @@ fn parse_command<'s>(k: Vec<&'s str>, v: Vec<&'s str>) -> Result<ConfigCommand> 
                     ))
                 },
                 ("pusher", 1, nm) => Ok(ElementState::Pusher { target: nm[0].to_owned() }),
-                _ => Err(format!("Invalid statespec {}<{}>", v[0], vl))
+                _ => Err(Error::gen(&format!("Invalid statespec {}<{}>", v[0], vl)))
 
             };
             state.map(|s| ConfigCommand::State { name: sname[0].to_owned(), state: s })
@@ -139,7 +139,7 @@ fn parse_command<'s>(k: Vec<&'s str>, v: Vec<&'s str>) -> Result<ConfigCommand> 
                 ConfigCommand::WireMonitoring{ name: n[0].to_owned(), trigger_mp: v[0].to_owned(), ot: ot}
             ),
         _ =>
-            Err("Commmand not recognized".to_owned())
+            Err(Error::gen("Commmand not recognized"))
     }
 }
 
@@ -152,8 +152,8 @@ pub fn parse_line(line: &str) -> Result<ConfigCommand> {
     let vo = fs.next().map(|f| f.split(FSEP).map(|s| s.trim()).collect());
     match (ko, vo) {
         (Some(k), Some(v)) => parse_command(k, v)
-            .map_err(|e| format!("Error: {} parsing command `{}`", e, line)),
-        _ => Err(format!("Invalid config command: `{}`", line))
+            .map_err(|e| Error::gen(&format!("Error: {} parsing command `{}`", e, line))),
+        _ => Err(Error::gen(&format!("Invalid config command: `{}`", line)))
     }
 }
 
@@ -200,11 +200,11 @@ impl PasswordTable {
                             if let (Some(url), Some(user), Some(pwd)) = (ourl, ouser, opwd) {
                                 r.insert((url.to_owned(), user.to_owned()), pwd.to_owned());
                             } else {
-                                return Err("invalid lines in password file".to_owned())
+                                return Err(Error::gen("invalid lines in password file"))
                             }
                         },
                         Err(e) => {
-                            return Err(format!("Error reading password file: {}", e))
+                            return Err(Error::io("Error reading password file", e))
                         }
                     }
                 }
@@ -214,7 +214,7 @@ impl PasswordTable {
                 if e.kind() == ErrorKind::NotFound {
                     Ok( PasswordTable { t: HashMap::new() })
                 } else {
-                    Err(format!("passwordfile at `{}` exists, but cannot be open: {}", fp.as_path().to_string_lossy(), e))
+                    Err(Error::io(&format!("passwordfile at `{}` exists, but cannot be open", fp.as_path().to_string_lossy()), e))
                 }
         }
     }

@@ -61,7 +61,7 @@ Configuration and CWD (these options are executed immediately once parsed):
                                     ignore default config file
 -w|--cd <path>                      chdir <path>
 -u|--username <username>            Set user name for secure URLs following this point in the
-                                    command line (default do no auth)
+                                    command line. '-' disables the auth (default)
 -p|--password <password>            Set password for secure URLs following this point in the
                                     command line. If set to '*', the actual password is read form
                                     the password file (default '*')
@@ -70,7 +70,7 @@ General:
 
 -l|--log-file <filepath>            log file (default stdout if --fg or 'zwaygw.log' otherwise)
 -L|--log-level off|error|warn|info|debug|trace
-                                    Set log level
+                                    Set log level (default info)
 -g|--device-config-line <cfgline>   Add cfgline to device configuration
 
 Z interface configuration:
@@ -111,58 +111,53 @@ fn parse_command_line(cfg: &mut AppConfig) {
     let mut username: Option<String> = None;
     let mut password = "*".to_owned();
 
-    fn process_url(a: String, username: &Option<String>, password: &String)
-        -> std::result::Result<SD, String>
+    fn process_url(a: String, username: &Option<String>, password: &String) -> Result<SD>
     {
         if a.starts_with("http://") { Ok(SD::URL(a)) }
         else if a.starts_with("https://") { Ok(SD::SURL(a, Creds::new_opt(username, password))) }
         else if a.starts_with("file:") { Ok(SD::Files((&a[5..]).to_owned())) }
-        else { Err(format!("invalid url `{}`", a)) }
+        else { Err(Error::gen(&format!("invalid url `{}`", a))) }
     };
 
-    match std::env::args().skip(1).flat_map(convert_arg).fold(None, |s, a| match s {
+    parse_cmdln( |s, a| match s {
         None => match a.as_ref() {
             "-f"|"--fg" => { cfg.g.daemonize = false; None },
-            "-x"|"--reset-config" => { *cfg = AppConfig::default(); None},
+            "-x"|"--reset-config" => { *cfg = AppConfig::default(); None },
             "-h"|"--help" => help(),
             "-v"|"--version" => version(),
             _ => Some(a)
         },
         Some(ref a0) => {
             match a0.as_ref() {
-                "-C"|"--config-file" => *cfg = read_config(&a).expect("unable to read config file"),
+                "-C"|"--config-file" => *cfg = read_config(&a).expect2("unable to read config file"),
                 "-W"|"--write-config-file" => save_config_file(&a, &cfg),
-                "-w"|"--cd" => std::env::set_current_dir(PathBuf::from(a)).expect("unable to cd"),
+                "-w"|"--cd" => std::env::set_current_dir(PathBuf::from(a)).expect2("unable to cd"),
                 "-l"|"--log-file" => cfg.g.log_file = Some(PathBuf::from(a)),
                 "-L"|"--log-level" => cfg.g.log_level = a,
                 "-P"|"--z-files" => cfg.z.sd = SD::Files(a),
-                "-U"|"--z-url" => cfg.z.sd = process_url(a, &username, &password).expect("Invalid Z URL"),
-                "-d"|"--z-delay" => cfg.z.delay_s = a.parse().expect("expected an int to `--z-delay`"),
-                "-e"|"--z-period" => cfg.z.period_max_s = a.parse().expect("expected an int to `--z-period`"),
-                "-i"|"--z-period-min" => cfg.z.period_min_s = a.parse().expect("expected an int to `--z-period-min`"),
+                "-U"|"--z-url" => cfg.z.sd = process_url(a, &username, &password).expect2("Invalid Z URL"),
+                "-d"|"--z-delay" => cfg.z.delay_s = a.parse().expect2("expected an int to `--z-delay`"),
+                "-e"|"--z-period" => cfg.z.period_max_s = a.parse().expect2("expected an int to `--z-period`"),
+                "-i"|"--z-period-min" => cfg.z.period_min_s = a.parse().expect2("expected an int to `--z-period-min`"),
                 "-A"|"--w-files" => cfg.w.sd = SD::Files(a),
-                "-S"|"--w-url" => cfg.w.sd = process_url(a, &username, &password).expect("Invalid W URL"),
-                "-j"|"--w-max-send-count" => cfg.w.max_send_count = a.parse().expect("expected unsigned int to --w-max-send-count"),
-                "-B"|"--w-period-long"  => cfg.w.period_long_s = a.parse().expect("expected unsigned int to --w-period-long"),
-                "-b"|"--w-period-short"  => cfg.w.period_short_s = a.parse().expect("expected unsigned int to --w-period-short"),
-                "-y"|"--w-error-delay"  => cfg.w.delay_error_s = a.parse().expect("expected unsigned int to --w-error-delay"),
-                "-g"|"--device-config-line" => cfg.c.push(parse_line(&a).expect("error parsing --device-config-line")),
+                "-S"|"--w-url" => cfg.w.sd = process_url(a, &username, &password).expect2("Invalid W URL"),
+                "-j"|"--w-max-send-count" => cfg.w.max_send_count = a.parse().expect2("expected unsigned int to --w-max-send-count"),
+                "-B"|"--w-period-long"  => cfg.w.period_long_s = a.parse().expect2("expected unsigned int to --w-period-long"),
+                "-b"|"--w-period-short"  => cfg.w.period_short_s = a.parse().expect2("expected unsigned int to --w-period-short"),
+                "-y"|"--w-error-delay"  => cfg.w.delay_error_s = a.parse().expect2("expected unsigned int to --w-error-delay"),
+                "-g"|"--device-config-line" => cfg.c.push(parse_line(&a).expect2("error parsing --device-config-line")),
                 "-u"|"--username" => username = match a.as_ref() { "-" => None, v => Some(v.to_owned()) },
                 "-p"|"--password" => password = a,
                 "--pid-file" => cfg.d.pid_file = Some(a),
                 "--chown-pid-file" => cfg.d.chown_pid_file = Some(bool_opt(a)),
                 "--daemon-user" => cfg.d.user = Some(a),
                 "--daemon-group" => cfg.d.group = Some(a),
-                "--daemon-group-n" => cfg.d.group_n = Some(a.parse().expect("expected unsigned int to --daemon-group-n")),
-                _ => panic!("Invalid cmd line at `{} {}`", a0, a)
+                "--daemon-group-n" => cfg.d.group_n = Some(a.parse().expect2("expected unsigned int to --daemon-group-n")),
+                _ => error_exit(&format!("Invalid cmd line at `{} {}`", a0, a), "unknown option")
             };
             None
         }
-    }) {
-        None => (),
-        Some(ref e) => panic!("Invalid cmd line at `{}`<EOL>", e)
-    }
-
+    })
 }
 
 fn run_client(mut z: ZOptions, mut w: WOptions, c: DeviceConfig, cwd: PathBuf) {

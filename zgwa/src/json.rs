@@ -61,7 +61,7 @@ impl JsonParser {
 
     pub fn parse_update(&self, r: &mut Read) -> Result<Vec<InterimTreeNode>> {
         serde_json::from_reader(r).map(|data| self.parse_tree(&data))
-            .map_err(|e| format!("json error: {}", e))
+            .map_err(|e| ::Error::other("json parse error", e))
     }
 }
 

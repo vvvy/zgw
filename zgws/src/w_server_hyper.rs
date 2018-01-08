@@ -13,8 +13,9 @@ use self::hyper::method::Method;
 use w::*;
 use nv::{NodeValue, TsNodeValue};
 use w_server::UWServerRunner;
-use Result;
-
+use ::*;
+use zgwlib::Error;
+use std::error::Error as StdError;
 
 
 struct UWServerHandler {
@@ -94,7 +95,7 @@ impl Handler for UWServerHandler {
         let umsgbr = match op {
             ApiOp::N => {
                 let nmsgr: Result<WNetMsg> =
-                    serde_json::from_reader(req).map_err(|e| format!("Error converting request: {}", e));
+                    serde_json::from_reader(req).map_err(|e| Error::other("JSON Error parsing request", e));
 
                 debug!("[N] Request: {:?}", nmsgr);
 
@@ -102,7 +103,7 @@ impl Handler for UWServerHandler {
                     self.runner.lock().map(
                         |mut uws| uws.handle_request(nmsg)
                     ).map_err(
-                        |e| format!("Mutex poison error {}", e)
+                        |_| Error::gen("Poisoned mutex: UWServerHandler::runner")
                     )
                 );
 
@@ -110,27 +111,27 @@ impl Handler for UWServerHandler {
 
                 umsgr.and_then(
                     |umsg| serde_json::to_vec(&umsg)
-                        .map_err(|e| format!("Error converting response: {}", e))
+                        .map_err(|e| Error::other("JSON error building response", e))
                 )
             },
             ApiOp::UGET(id) => {
                 let umsgr = self.runner.lock().map(
                         move |mut uws| uws.push(UserUpdate::new_get(id))
                     ).map_err(
-                        |e| format!("Mutex poison error {}", e)
+                        |_| Error::gen("Poisoned mutex: UWServerHandler::runner")
                     ).map(|_| UResponse::Ok {});
 
                 debug!("[U] Reply: {:?}", umsgr);
 
                 umsgr.and_then(
                     |umsg| serde_json::to_vec(&umsg)
-                        .map_err(|e| format!("Error converting response: {}", e))
+                        .map_err(|e| Error::other("JSON error building response", e))
                 )
             },
             ApiOp::USET(id, value) => {
                 use std::time::{UNIX_EPOCH, SystemTime};
                 let now_r =
-                    SystemTime::now().duration_since(UNIX_EPOCH).map_err(|e| format!("Sys time err: {}", e));
+                    SystemTime::now().duration_since(UNIX_EPOCH).map_err(|e| Error::other("Sys time error", e));
 
                 let nv_r = self.make_node_value(&id, value);
 
@@ -146,17 +147,17 @@ impl Handler for UWServerHandler {
                     |uu| self.runner.lock().map(
                         move |mut uws| uws.push(uu)
                     ).map_err(
-                        |e| format!("Mutex poison error {}", e)
+                        |_| Error::gen("Poisoned mutex: UWServerHandler::runner")
                     )).map(|_| UResponse::Ok {});;
 
                 debug!("[U] Reply: {:?}", umsgr);
 
                 umsgr.and_then(
                     |umsg| serde_json::to_vec(&umsg)
-                        .map_err(|e| format!("Error converting response: {}", e))
+                        .map_err(|e| Error::other("Error converting response", e))
                 )
             },
-            ref x => Err(format!("invalid request-uri `{}`", x))
+            ref x => Err(Error::gen(&format!("invalid request-uri `{}`", x)))
 
         };
 
@@ -168,7 +169,7 @@ impl Handler for UWServerHandler {
                 *res.status_mut() = StatusCode::BadRequest;
 
                 res.send(
-                    &serde_json::to_vec(&UResponse::Error { message: e }).unwrap_or_else(
+                    &serde_json::to_vec(&UResponse::Error { message: e.description().to_owned() }).unwrap_or_else(
                         |e| format!("status: error, message: {}", e).into_bytes()
                     )
                 )
@@ -186,5 +187,5 @@ pub fn run_uw_server_hyper<'t>(hostport: &'t str, sr: UWServerRunner, nv_types: 
     Server::http(hostport).and_then(|srv| srv.handle(UWServerHandler {
         runner: Mutex::new(sr),
         nv_types: nv_types
-    })).map_err(|e| format!("error listening: {}", e))
+    })).map_err(|e| Error::other("error listening", e))
 }

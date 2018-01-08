@@ -58,7 +58,7 @@ impl<'t> FsmState for Updater<'t> {
             &Event::UserUpdate(TsNodeValue { value: ref v, ts: _ }) =>
                 match (self.uf)(v) {
                     Some(op) => self.ps.exec(self.ot, op),
-                    None => Err(format!("Invalid NV for updater: {}", v))
+                    None => Err(::Error::gen(&format!("Invalid NV for updater: {}", v)))
                 }.map(|_| true),
             &Event::UserGet =>
                 self.ps.exec(self.ot, DeviceOperation::Get).map(|_| true),

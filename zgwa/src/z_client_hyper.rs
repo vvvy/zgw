@@ -28,7 +28,7 @@ fn intercept_errors(mut r: Response) -> Result<Response> {
             Ok(_) => format!("{}", String::from_utf8_lossy(&body)),
             Err(e) => format!("Couldn't read body text: {}", e)
         };
-        Err(format!("HyperConnector: invalid response: {} `{}`", r.status, bodytext))
+        Err(Error::gen(&format!("HyperConnector: invalid response: {} `{}`", r.status, bodytext)))
     } else {
         Ok(r)
     }
@@ -60,7 +60,7 @@ impl ZClient for HyperZClient {
         Client::new().get(
             &zw_data_string(&self.urlbase, ts)
         ).send().map_err(
-            |e| format!("HyperConnector: request error: {}", e)
+            |e| Error::other("HyperConnector: request error", e)
         ).and_then(
             intercept_errors
         ).and_then(
@@ -71,7 +71,7 @@ impl ZClient for HyperZClient {
         Client::new().get(
             &zw_cmd_string(&self.urlbase, target, op)
         ).send().map_err(
-            |e| format!("HyperConnector: request error: {}", e)
+            |e| Error::other("HyperConnector: request error", e)
         ).and_then(
             intercept_errors
         ).and_then(
@@ -122,7 +122,7 @@ impl<'t> AddOptAuth for RequestBuilder<'t> {
 impl ZClient for SecureHyperZClient {
     fn collect_updates(&self, ts: u32, sk: &mut ZNotificationTarget) -> Result<()> {
         NativeTlsClient::new().map_err(
-            |e| format!("HyperConnector: TLS initialization error: {}", e)
+            |e| Error::other("HyperConnector: TLS initialization error", e)
         ).and_then(
             |ssl|
                 Client::with_connector(HttpsConnector::new(ssl)).get(
@@ -131,7 +131,7 @@ impl ZClient for SecureHyperZClient {
                     &self.auth
                 ).send(
                 ).map_err(
-                    |e| format!("HyperConnector: request error: {}", e)
+                    |e| Error::other("HyperConnector: request error", e)
                 ).and_then(
                     intercept_errors
                 ).and_then(
@@ -141,7 +141,7 @@ impl ZClient for SecureHyperZClient {
     }
     fn exec(&self, target: OperationTarget, op: DeviceOperation) -> Result<()> {
         NativeTlsClient::new().map_err(
-            |e| format!("HyperConnector: TLS initialization error: {}", e)
+            |e| Error::other("HyperConnector: TLS initialization error", e)
         ).and_then(
             |ssl|
                 Client::with_connector(HttpsConnector::new(ssl)).get(
@@ -150,7 +150,7 @@ impl ZClient for SecureHyperZClient {
                     &self.auth
                 ).send(
                 ).map_err(
-                    |e| format!("HyperConnector: request error: {}", e)
+                    |e| Error::other("HyperConnector: request error", e)
                 ).and_then(
                     intercept_errors
                 ).and_then(

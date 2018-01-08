@@ -10,6 +10,7 @@ use std::io::Read;
 use w_client::*;
 use w::*;
 use zgwlib::Result;
+use ::*;
 
 extern crate serde_json;
 
@@ -30,7 +31,7 @@ fn intercept_errors(mut r: Response) -> Result<Response> {
             Ok(_) => format!("{}", String::from_utf8_lossy(&body)),
             Err(e) => format!("Couldn't read body text: {}", e)
         };
-        Err(format!("[S]HyperWClient: invalid response: {} `{}`", r.status, bodytext))
+        Err(Error::gen(&format!("[S]HyperWClient: invalid response: {} `{}`", r.status, bodytext)))
     } else {
         Ok(r)
     }
@@ -39,20 +40,20 @@ fn intercept_errors(mut r: Response) -> Result<Response> {
 impl WClient for HyperWClient {
     fn do_request(&self, m: WNetMsg) -> Result<WUserMsg> {
         serde_json::to_string(&m).map_err(
-            |e| format!("to-json error: {}", e)
+            |e| Error::other("to-json error", e)
         ).and_then( |body|
             Client::new().post(
                 &self.url
             ).body(
                 &body
             ).send().map_err(
-                |e| format!("request error: {}", e)
+                |e| Error::other("request error", e)
             )
         ).and_then(
             intercept_errors
         ).and_then(
             |r| serde_json::from_reader(r).map_err(
-                |e| format!("from-json error: {}", e)
+                |e| Error::other("from-json error", e)
             )
         )
     }
@@ -100,10 +101,10 @@ impl<'t> AddOptAuth for RequestBuilder<'t> {
 impl WClient for SecureHyperWClient {
     fn do_request(&self, m: WNetMsg) -> Result<WUserMsg> {
         NativeTlsClient::new().map_err(
-            |e| format!("SecureHyperWClient: TLS initialization error: {}", e)
+            |e| Error::other("SecureHyperWClient: TLS initialization error", e)
         ).and_then(|ssl|
             serde_json::to_string(&m).map_err(
-                |e| format!("to-json error: {}", e)
+                |e| Error::other("to-json error", e)
             ).and_then(|body|
                 Client::with_connector(
                     HttpsConnector::new(ssl)
@@ -112,14 +113,14 @@ impl WClient for SecureHyperWClient {
                 ).body(
                     &body
                 ).add_opt_auth(&self.auth).send().map_err(
-                    |e| format!("request error: {}", e)
+                    |e| Error::other("request error", e)
                 )
             )
         ).and_then(
             intercept_errors
         ).and_then(
             |r| serde_json::from_reader(r).map_err(
-                |e| format!("from-json error: {}", e)
+                |e| Error::other("from-json error", e)
             )
         )
     }
