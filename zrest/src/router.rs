@@ -615,7 +615,7 @@ macro_rules! route(
 
 
 #[macro_export]
-macro_rules! route_builder(
+macro_rules! route_builder_boxed(
     { $t:ty, $($pat:expr => $act:expr),+ } => { {
         let mut b = ::router::Builder::<$t>::new();
         $(b.mount(::router::parse_uri_pattern($pat), Box::new($act));)+
@@ -623,6 +623,14 @@ macro_rules! route_builder(
         } }
 );
 
+#[macro_export]
+macro_rules! route_builder(
+    { $t:ty, $($pat:expr => $act:expr),+ } => { {
+        let mut b = ::router::Builder::<$t>::new();
+        $(b.mount(::router::parse_uri_pattern($pat), $act);)+
+        b
+        } }
+);
 
 ///-------------------------------------------------------------------------------------------------
 /// this solely exists for the tests to work.

@@ -12,9 +12,20 @@ pub mod client;
 mod uri_scanner;
 #[macro_use] pub mod server;
 #[macro_use] mod router;
+pub mod wrappers;
 
 use std::error::Error as StdError;
 use std::fmt;
+
+
+
+pub use server::*;
+pub use client::*;
+pub use router::*;
+pub use wrappers::*;
+pub use serde_json::Value as JsValue;
+pub use serde::ser::Serialize as Ser;
+pub use serde::de::DeserializeOwned as Des;
 
 #[derive(Debug)]
 pub enum ZRError {
@@ -162,11 +173,6 @@ mod client_tests {
 }
 
 
-pub use server::*;
-pub use client::*;
-pub use router::*;
-pub use serde_json::Value as JsValue;
-
 
 
 #[cfg(test)]
@@ -175,10 +181,11 @@ mod server_tests {
     use hyper::server::{Service, NewService};
     use futures::sync::oneshot::*;
     use futures::Future;
-    use ::*;
+    use super::*;
 
+    /*
     #[test]
-    fn test_server() {
+    fn test_server_raw() {
         fn convert_vars(vars: Vec<Val>) -> JsValue {
             vars.into_iter().map(|val| match val {
                 Val::Str(s) => json!({"str" : s}),
@@ -219,6 +226,120 @@ mod server_tests {
         //println!("SERVER: {:?}", res);
 
         //std::thread::sleep_ms(60000);
+        snd.send(()).unwrap();
+    }
+
+
+    #[test]
+    fn test_server_typed() {
+        #[derive(Serialize, Deserialize, Debug, PartialEq)]
+        struct TIO {
+            s: String,
+            i: i64
+        }
+
+        let (snd, recv) = channel::<()>();
+        std::thread::spawn(|| {
+
+            let b = route_builder!(
+                AsyncActionFn<TIO, GOW<TIO>>,
+                "v0/default" => const_action!(Output::Typed(GOW::ok(TIO { s: "default".to_owned(), i: 0 }))),
+                "v0/mult/$i" => typed_input_action!(|vars: Vec<Val>, _| Output::Typed(GOW::ok(TIO { s: /*input.s +*/ "_multiplied".to_owned(), i: 1/*input.i*/ })))
+            );
+
+            let svc = ZService::new(b, Box::new(error_action!("routing failed"))).unwrap();
+
+            let addr = "127.0.0.1:3001".parse().unwrap();
+            let server = Http::new().bind(&addr, to_new_service!(svc)).unwrap();
+            server.run_until(recv.map_err(|_canceled| ()))
+        });
+
+        let mut cl = ZHttpsClient::new(1).unwrap();
+        let res = cl.get::<GOW<TIO>>("http://127.0.0.1:3001/v0/default".parse().unwrap()).unwrap();
+        assert_eq!(res, GOW::ok(TIO { s: "default".to_owned(), i: 0 }));
+        println!("### {:?}", res);
+
+        snd.send(()).unwrap();
+    }
+    */
+    #[test]
+    fn test_server_raw() {
+        fn convert_vars(vars: Vec<Val>) -> JsValue {
+            vars.into_iter().map(|val| match val {
+                Val::Str(s) => json!({"str" : s}),
+                Val::Int(i) => json!({"int" : i}),
+                Val::Float(f) => json!({"float" : f}),
+            }).collect()
+        }
+
+        let (snd, recv) = channel::<()>();
+        std::thread::spawn(|| {
+
+            let b = route_builder!(
+                AsyncActionFn,
+                "v0/static" => AsyncActionFn::constant::<JsValue, JsValue, _>(|| json!({"static":"true", "message": "v0/static"})),
+                "v0/str/$/a" => AsyncActionFn::v_r::<String, JsValue, JsValue, _>(|s| Ok(json!({"op":"a", "type": "str", "vars": [{"str" : s}] }))),
+                "v0/mixed/$i/$f/a" => AsyncActionFn::v_r::<(i64, f64), JsValue, JsValue, _ >(|(i, f)| Ok(json!({"op":"a", "type": "mixed", "vars": [{"int" : i}, {"float" : f}] })))
+            );
+
+            let svc = ZService::new(b, error_action!("routing failed")).unwrap();
+
+            let addr = "127.0.0.1:3000".parse().unwrap();
+            let server = Http::new().bind(&addr, to_new_service!(svc)).unwrap();
+            server.run_until(recv.map_err(|_canceled| ()))
+        });
+
+        let mut cl = ZHttpsClient::new(1).unwrap();
+
+        let res = cl.get::<JsValue>("http://127.0.0.1:3000/v0/static".parse().unwrap()).unwrap();
+        assert_eq!(res, json!({"static":"true", "message": "v0/static"}));
+        //println!("SERVER: {:?}", res);
+
+        let res = cl.get::<JsValue>("http://127.0.0.1:3000/v0/str/abcd/a".parse().unwrap()).unwrap();
+        assert_eq!(res, json!({"op":"a", "type": "str", "vars": [{"str" : "abcd"}] }));
+        //println!("SERVER: {:?}", res);
+
+        let res = cl.get::<JsValue>("http://127.0.0.1:3000/v0/mixed/10/0.25/a".parse().unwrap()).unwrap();
+        assert_eq!(res, json!({"op":"a", "type": "mixed", "vars": [{"int" : 10}, {"float" : 0.25}] }));
+        //println!("SERVER: {:?}", res);
+
+        //std::thread::sleep_ms(60000);
+        snd.send(()).unwrap();
+    }
+
+    #[test]
+    fn test_server_custom() {
+        #[derive(Serialize, Deserialize, Debug, PartialEq)]
+        struct TIO {
+            s: String,
+            i: i64
+        }
+
+        let (snd, recv) = channel::<()>();
+        std::thread::spawn(|| {
+            let b = route_builder!(
+                AsyncActionFn,
+                "v0/default" => AsyncActionFn::constant::<OW<TIO>, EW, _>(|| OW::new(TIO { s: "default".to_owned(), i: 0 })),
+                "v0/n/$i" => AsyncActionFn::v_r::<i64, OW<TIO>, EW, _>(|n: i64| Ok(OW::new(TIO { s: "n".to_owned(), i: n }))),
+                "v0/nm/$i" => AsyncActionFn::vq_r::<i64, TIO, OW<TIO>, EW, _>(|n: i64, q: TIO| Ok(OW::new(TIO { s: q.s + "_nm", i: n * q.i })))
+            );
+
+            let svc = ZService::new(b, error_action!("routing failed")).unwrap();
+
+            let addr = "127.0.0.1:3002".parse().unwrap();
+            let server = Http::new().bind(&addr, to_new_service!(svc)).unwrap();
+            server.run_until(recv.map_err(|_canceled| ()))
+        });
+
+        let mut cl = ZHttpsClient::new(1).unwrap();
+        let res = cl.get::<GOW<TIO>>("http://127.0.0.1:3002/v0/default".parse().unwrap()).unwrap();
+        assert_eq!(res, GOW::ok(TIO { s: "default".to_owned(), i: 0 }));
+        println!("### {:?}", res);
+
+        let res = cl.get::<GOW<TIO>>("http://127.0.0.1:3002/v0/n/33".parse().unwrap()).unwrap();
+        println!("### {:?}", res);
+        let res = cl.post::<TIO, GOW<TIO>>("http://127.0.0.1:3002/v0/nm/44".parse().unwrap(), &TIO { s: "abc".to_owned(), i: 2 }, &None).unwrap();
+        println!("### {:?}", res);
         snd.send(()).unwrap();
     }
 
