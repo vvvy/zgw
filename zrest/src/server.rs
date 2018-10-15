@@ -1,3 +1,308 @@
+use std::net::SocketAddr;
+use tls_server;
+use tokio_tcp::TcpListener;
+use futures::{Future, Stream, future};
+use hyper::{
+    self,
+    Body, Request, Response, //Method,  StatusCode,
+    server::Server,
+    service::service_fn,
+    rt
+};
+use http::response::Builder as ResponseBuilder;
+use serde_json;
+use serde;
+use mime;
+
+use common::*;
+use auth::*;
+use error::*;
+
+fn http_process_request<Q>(
+    req: Request<Body>
+) -> impl Future<Item=Q, Error=ZError> + Send
+    where Q: serde::de::DeserializeOwned + Send {
+    use std::str::FromStr;
+    let m = req.headers()
+        .get(hyper::header::CONTENT_TYPE)
+        .map(|s| s.to_str().map(|x| mime::Mime::from_str(x)));
+    let r = future::result(match m {
+        Some(Ok(Ok(ref ct))) if ct.type_() == mime::APPLICATION && ct.subtype() == mime::JSON =>
+            Ok(req),
+        Some(Ok(Ok(ref ct))) =>
+            Err(rest_error!(other "invalid content type `{}`", ct)),
+        Some(Ok(Err(ect))) =>
+            Err(ect.into()),
+        Some(Err(ect)) =>
+            Err(ect.into()),
+        None =>
+            Err(rest_error!(other "no content type found (application/json required)"))
+    });
+    r.and_then(|req|
+        req.into_body().concat2().map_err(|err| err.into())
+    )
+        .and_then(|body|
+            serde_json::from_slice(&body).map_err(|err| err.into())
+        )
+}
+
+fn http_attach_response_data<R>(mut rsp: ResponseBuilder, r: &R)-> Result<Response<Body>, ZError>
+    where R: serde::ser::Serialize
+{
+    rsp.header(hyper::header::CONTENT_TYPE, mime::APPLICATION_JSON.as_ref());
+    let data =  serde_json::to_vec(r)?;
+    //let dlen = data.len();
+    //req.header(hyper::header::CONTENT_LENGTH, dlen as u64);
+    let body: Body = data.into();
+    let rv = rsp.body(body)?;
+    Ok(rv)
+}
+
+pub enum ServerType {
+    HTTP,
+    HTTPS { cert: Vec<u8>, passwd: String }
+}
+
+impl ServerType {
+    pub fn run_raw<K>(self, addr: SocketAddr, auth: BasicAuth, handler: impl Fn() -> K + Send + 'static) -> Result<(), ZError> where
+        K: Fn(Request<Body>) -> BoxFut + Send + 'static
+    {
+        let srv = TcpListener::bind(&addr).map_err(|e| Into::<ZError>::into(e))?;
+        let new_service=
+            move || service_fn({
+                let auth_handler = auth.clone().run_server(handler());
+                move |req| {
+                    info!("Incoming req:: {:?}", req);
+                    auth_handler(req)
+                }
+            });
+        info!("Listening on {}", addr);
+        match self {
+            ServerType::HTTPS { cert, passwd } => {
+                let tls_cx = tls_server::create_tls_cx(&cert, &passwd)?;
+                let http_server = tls_server::TlsServer::create(srv, tls_cx, new_service);
+                rt::run(http_server);
+                Ok(())
+            }
+            ServerType::HTTP => {
+                let http_server = Server::bind(&addr)
+                    .serve(new_service)
+                    .map_err(|e| error!("Error creating service: {}", e))
+                ;
+                rt::run(http_server);
+                Ok(())
+            }
+        }
+    }
+
+    pub fn run<K, L, M, Q, R>(self, addr: SocketAddr, auth: BasicAuth, handler: impl Fn() -> K + Send + 'static) -> Result<(), ZError> where
+        K: Fn(&str) -> L + Send + 'static,
+        L: Fn(Q) -> M + Send + 'static,
+        M: Future<Item=R, Error=ZError> + Send + 'static,
+        Q: serde::de::DeserializeOwned + Send + 'static,
+        R: serde::ser::Serialize + Send
+    {
+        self.run_raw(addr, auth, move || {
+            let k = handler();
+            move |req: Request<Body>| {
+                let l = k(req.uri().path());
+                Box::new(http_process_request(req)
+                    .and_then(move |q| l(q))
+                    .and_then(|r: R| {
+                        future::result(http_attach_response_data(ResponseBuilder::new(), &r))
+                    }))
+            }
+        })
+    }
+}
+
+
+
+
+
+
+//--------------------------------------------------------------------------------------------------
+/*
+#[cfg(test)]
+mod server_tests {
+    use hyper::server::Http;
+    use hyper::server::{Service, NewService};
+    use futures::sync::oneshot::*;
+    use futures::Future;
+    use super::*;
+
+    /*
+    #[test]
+    fn test_server_raw() {
+        fn convert_vars(vars: Vec<Val>) -> JsValue {
+            vars.into_iter().map(|val| match val {
+                Val::Str(s) => json!({"str" : s}),
+                Val::Int(i) => json!({"int" : i}),
+                Val::Float(f) => json!({"float" : f}),
+            }).collect()
+        }
+
+        let (snd, recv) = channel::<()>();
+        std::thread::spawn(|| {
+
+            let b = route_builder!(
+                AsyncActionFn<JsValue, JsValue>,
+                "v0/static" => const_action!(Output::Typed(json!({"static":"true", "message": "v0/static"}))),
+                "v0/str/$/a" => no_input_action!(|vars: Vec<Val>| Output::Typed(json!({"op":"a", "type": "str", "vars": convert_vars(vars) }))),
+                "v0/mixed/$i/$f/a" => no_input_action!(|vars: Vec<Val>| Output::Typed(json!({"op":"a", "type": "mixed", "vars": convert_vars(vars) })))
+            );
+
+            let svc = ZService::new(b, Box::new(error_action!("routing failed"))).unwrap();
+
+            let addr = "127.0.0.1:3000".parse().unwrap();
+            let server = Http::new().bind(&addr, to_new_service!(svc)).unwrap();
+            server.run_until(recv.map_err(|_canceled| ()))
+        });
+
+        let mut cl = ZHttpsClient::new(1).unwrap();
+
+        let res = cl.get::<JsValue>("http://127.0.0.1:3000/v0/static".parse().unwrap()).unwrap();
+        assert_eq!(res, json!({"static":"true", "message": "v0/static"}));
+        //println!("SERVER: {:?}", res);
+
+        let res = cl.get::<JsValue>("http://127.0.0.1:3000/v0/str/abcd/a".parse().unwrap()).unwrap();
+        assert_eq!(res, json!({"op":"a", "type": "str", "vars": [{"str" : "abcd"}] }));
+        //println!("SERVER: {:?}", res);
+
+        let res = cl.get::<JsValue>("http://127.0.0.1:3000/v0/mixed/10/0.25/a".parse().unwrap()).unwrap();
+        assert_eq!(res, json!({"op":"a", "type": "mixed", "vars": [{"int" : 10}, {"float" : 0.25}] }));
+        //println!("SERVER: {:?}", res);
+
+        //std::thread::sleep_ms(60000);
+        snd.send(()).unwrap();
+    }
+
+
+    #[test]
+    fn test_server_typed() {
+        #[derive(Serialize, Deserialize, Debug, PartialEq)]
+        struct TIO {
+            s: String,
+            i: i64
+        }
+
+        let (snd, recv) = channel::<()>();
+        std::thread::spawn(|| {
+
+            let b = route_builder!(
+                AsyncActionFn<TIO, GOW<TIO>>,
+                "v0/default" => const_action!(Output::Typed(GOW::ok(TIO { s: "default".to_owned(), i: 0 }))),
+                "v0/mult/$i" => typed_input_action!(|vars: Vec<Val>, _| Output::Typed(GOW::ok(TIO { s: /*input.s +*/ "_multiplied".to_owned(), i: 1/*input.i*/ })))
+            );
+
+            let svc = ZService::new(b, Box::new(error_action!("routing failed"))).unwrap();
+
+            let addr = "127.0.0.1:3001".parse().unwrap();
+            let server = Http::new().bind(&addr, to_new_service!(svc)).unwrap();
+            server.run_until(recv.map_err(|_canceled| ()))
+        });
+
+        let mut cl = ZHttpsClient::new(1).unwrap();
+        let res = cl.get::<GOW<TIO>>("http://127.0.0.1:3001/v0/default".parse().unwrap()).unwrap();
+        assert_eq!(res, GOW::ok(TIO { s: "default".to_owned(), i: 0 }));
+        println!("### {:?}", res);
+
+        snd.send(()).unwrap();
+    }
+    */
+    #[test]
+    fn test_server_raw() {
+        fn convert_vars(vars: Vec<Val>) -> JsValue {
+            vars.into_iter().map(|val| match val {
+                Val::Str(s) => json!({"str" : s}),
+                Val::Int(i) => json!({"int" : i}),
+                Val::Float(f) => json!({"float" : f}),
+            }).collect()
+        }
+
+        let (snd, recv) = channel::<()>();
+        std::thread::spawn(|| {
+
+            let b = route_builder!(AsyncActionFn,
+                "v0/static" => AsyncActionFn::constant::<JsValue, JsValue, _>(|| json!({"static":"true", "message": "v0/static"})),
+                //"v0/str/$/a" => AsyncActionFn::v_r::<String, JsValue, JsValue, _>(|s| Ok(json!({"op":"a", "type": "str", "vars": [{"str" : s}] }))),
+                "v0/str/$/a" => z_action!([String] => (JsValue, JsValue) { |s| Ok(json!({"op":"a", "type": "str", "vars": [{"str" : s}] })) }),
+                "v0/mixed/$i/$f/a" => AsyncActionFn::v_r::<(i64, f64), JsValue, JsValue, _ >(|(i, f)| Ok(json!({"op":"a", "type": "mixed", "vars": [{"int" : i}, {"float" : f}] })))
+            );
+
+            let svc = ZService::new(b, error_action!("routing failed")).unwrap();
+
+            let addr = "127.0.0.1:3000".parse().unwrap();
+            let server = Http::new().bind(&addr, to_new_service!(svc)).unwrap();
+            server.run_until(recv.map_err(|_canceled| ()))
+        });
+
+        let mut cl = ZHttpsClient::new(1).unwrap();
+
+        let res = cl.get::<JsValue>("http://127.0.0.1:3000/v0/static".parse().unwrap()).unwrap();
+        assert_eq!(res, json!({"static":"true", "message": "v0/static"}));
+        //println!("SERVER: {:?}", res);
+
+        let res = cl.get::<JsValue>("http://127.0.0.1:3000/v0/str/abcd/a".parse().unwrap()).unwrap();
+        assert_eq!(res, json!({"op":"a", "type": "str", "vars": [{"str" : "abcd"}] }));
+        //println!("SERVER: {:?}", res);
+
+        let res = cl.get::<JsValue>("http://127.0.0.1:3000/v0/mixed/10/0.25/a".parse().unwrap()).unwrap();
+        assert_eq!(res, json!({"op":"a", "type": "mixed", "vars": [{"int" : 10}, {"float" : 0.25}] }));
+        //println!("SERVER: {:?}", res);
+
+        //std::thread::sleep_ms(60000);
+        snd.send(()).unwrap();
+    }
+
+    #[test]
+    fn test_server_custom() {
+        #[derive(Serialize, Deserialize, Debug, PartialEq)]
+        struct TIO {
+            s: String,
+            i: i64
+        }
+
+        let (snd, recv) = channel::<()>();
+        std::thread::spawn(|| {
+            let b = route_builder!(AsyncActionFn,
+                "v0/default" => AsyncActionFn::constant::<OW<TIO>, EW, _>(|| OW::new(TIO { s: "default".to_owned(), i: 0 })),
+                "v0/n/$i" => AsyncActionFn::v_r::<i64, OW<TIO>, EW, _>(|n: i64| Ok(OW::new(TIO { s: "n".to_owned(), i: n }))),
+                "v0/nm/$i" => AsyncActionFn::vq_r::<i64, TIO, OW<TIO>, EW, _>(|n: i64, q: TIO| Ok(OW::new(TIO { s: q.s + "_nm", i: n * q.i })))
+            );
+
+            let svc = ZService::new(b, error_action!("routing failed")).unwrap();
+
+            let addr = "127.0.0.1:3002".parse().unwrap();
+            let server = Http::new().bind(&addr, to_new_service!(svc)).unwrap();
+            server.run_until(recv.map_err(|_canceled| ()))
+        });
+
+        let mut cl = ZHttpsClient::new(1).unwrap();
+        let res = cl.get::<GOW<TIO>>("http://127.0.0.1:3002/v0/default".parse().unwrap()).unwrap();
+        assert_eq!(res, GOW::ok(TIO { s: "default".to_owned(), i: 0 }));
+        println!("### {:?}", res);
+
+        let res = cl.get::<GOW<TIO>>("http://127.0.0.1:3002/v0/n/33".parse().unwrap()).unwrap();
+        assert_eq!(res, GOW::ok(TIO { s: "n".to_owned(), i: 33 }));
+        println!("### {:?}", res);
+        let res = cl.post::<TIO, GOW<TIO>>("http://127.0.0.1:3002/v0/nm/44".parse().unwrap(), &TIO { s: "abc".to_owned(), i: 2 }, &None).unwrap();
+        assert_eq!(res, GOW::ok(TIO { s: "abc_nm".to_owned(), i: 88 }));
+        println!("### {:?}", res);
+        snd.send(()).unwrap();
+    }
+
+}
+
+*/
+
+//--------------------------------------------------------------------------------------------------
+//--------------------------------------------------------------------------------------------------
+//--------------------------------------------------------------------------------------------------
+
+
+
+/*
 use futures::{Future, Stream};
 use futures::future;
 //use tokio_core::reactor::Core;
@@ -361,8 +666,21 @@ macro_rules! error_action(
     { $s:expr, $d:expr } => { AsyncActionFn::error::<EW, _>(||EW::new_s($s.to_owned(), $d.to_owned())) };
 );
 
+macro_rules! z_action {
+    { [$vt:ty] => ($o:ty, $e:ty) { $b:expr } } => { AsyncActionFn::v_r::<$vt, $o, $e, _>($b) };
+    { [$vt:ty] $i:ty => ($o:ty, $e:ty) { $b:expr } } => { AsyncActionFn::vq_r::<$vt, $i, $o, $e, _>($b) };
+}
 
+#[macro_export]
+macro_rules! z_route_builder {
+    { $($pat:expr => $act:tt),+ } => { {
+        let mut b = ::router::Builder::<$t>::new();
+        $(b.mount(::router::parse_uri_pattern($pat), $act);)+
+        b
+        } }
+}
 
+*/
 //==================================================================================================
 /*
 

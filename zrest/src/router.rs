@@ -1,8 +1,7 @@
-use mime::Mime;
-use ::*;
-
-use std::collections::hash_map::{HashMap, Entry};
-use std::fmt::Debug;
+use mime::{self, Mime};
+use common::*;
+use error::*;
+use std::{self, collections::hash_map::{HashMap, Entry}, fmt::Debug};
 
 macro_rules! hash_map(
     { $($key:expr => $value:expr),+ } => {
@@ -153,6 +152,14 @@ impl<A> BNode<A> {
 #[derive(Debug)]
 pub enum Val {
     Str(String),
+    Int(i64),
+    Float(f64)
+}
+
+/// The value of a request-uri var
+#[derive(Debug)]
+pub enum ValRef<'a> {
+    Str(&'a str),
     Int(i64),
     Float(f64)
 }
@@ -310,9 +317,9 @@ impl LabelTable {
     }
 
     /// if the label is virtual, convert it to physical.
-    fn materialize(&self, l: Label) -> ZRResult<Label> {
+    fn materialize(&self, l: Label) -> ZResult<Label> {
         if l > self.threshold {
-            self.t[mirror_label(l)].ok_or(ZRError::EZR(format!("internal error: missing label ({})", l)))
+            self.t[mirror_label(l)].ok_or(rest_error!(other "internal error: missing label ({})", l))
         } else {
             Ok(l)
         }
@@ -485,12 +492,12 @@ impl<A> RTree<A> where A: Debug {
 }
 
 impl<A> RTree<A> {
-    pub fn build(b: Builder<A>, a_failure: A) -> ZRResult<RTree<A>> {
+    pub fn build(b: Builder<A>, a_failure: A) -> ZResult<RTree<A>> {
         let (RTreeBuildContext { la, result: chunks, err, l_failure: _ }, entry) =
             RTreeBuildContext::create(b, a_failure);
 
         if let Some(m) = err {
-            return Err(ZRError::EZR(m));
+            return Err(ZError::Other(Cow::from(m)));
         }
 
         //label table. for each label (@offset), holds its offset within the resulting tree
@@ -518,7 +525,7 @@ impl<A> RTree<A> {
         }
 
         if !label_table.is_valid(tree.len()) {
-            return Err(ZRError::EZR(format!("code too big ({})", tree.len())));
+            return Err(rest_error!(other "code too big ({})", tree.len()));
         }
 
         //pass two: replace labels with actual offsets
@@ -535,7 +542,7 @@ impl<A> RTree<A> {
         Ok(RTree { tree: tree, init: label_table.materialize(entry)? })
     }
 
-    pub fn run<'t, 'q>(&'t self, s: &'q str, mct_a: MCTR<'q>) -> ZRResult<(&'t A, Vec<Val>)> {
+    pub fn run<'t, 'q>(&'t self, s: &'q str, mct_a: MCTR<'q>) -> ZResult<(&'t A, Vec<Val>)> {
         let mut sc = Scanner::new(&s);
 
         enum O {
@@ -554,7 +561,7 @@ impl<A> RTree<A> {
                 &RNode::Run(ref a) => break Ok((a, vars)),
                 &RNode::Branch { ref cond, b_success, b_failure } => {
                     let res = match (&cv, cond) {
-                        (&Some(E::ERR(serr)), _) => break Err(ZRError::from(serr.clone())),
+                        (&Some(E::ERR(serr)), _) => break Err(ZError::from(serr.clone())),
                         (&Some(E::CH(ch1)), &RCond::Ch(ch2)) if ch1 == ch2 => O::SG(b_success),
                         (&Some(E::ST), &RCond::Sep) => O::SG(b_success),
                         (&None, &RCond::EOT) => O::SG(b_success),
@@ -591,7 +598,6 @@ impl<A> RTree<A> {
 
 ///-------------------------------------------------------------------------------------------------
 /// parses uri pattern from string
-///
 
 pub fn parse_uri_pattern(pattern: &str) -> Vec<Condition> {
     pattern.split('/').filter(|s|!s.is_empty()).map(|s|
@@ -602,6 +608,43 @@ pub fn parse_uri_pattern(pattern: &str) -> Vec<Condition> {
             oth => Condition::CStr(oth.to_string())
         }
     ).collect()
+}
+
+/// builds URI string from a parsed pattern and a slice of `ValRef`s. `Condition::MCT` is ignored.
+pub fn build_uri<'a>(pattern: &'a Vec<Condition>, vals: &'a [ValRef<'a>]) -> ZResult<String> {
+    let mut o = String::new();
+    let mut vpos = 0;
+    for cond in pattern {
+        match cond {
+            Condition::MCT(_) => (),
+            Condition::CStr(s) => {
+                if !o.is_empty() { o.push('/') }
+                o += s
+            }
+            Condition::Var(vt) => {
+                if vpos >= vals.len() {
+                    return Err(rest_error!(other "Insufficient actual args for pattern"))
+                }
+                if !o.is_empty() { o.push('/') }
+                match (vt, &vals[vpos]) {
+                    (VarType::Str, ValRef::Str(s)) => o += s,
+                    (VarType::Int, ValRef::Int(i)) => o += &format!("{}", i),
+                    (VarType::Float, ValRef::Float(f)) => o += &format!("{}", f),
+                    (vt, vr) => return Err(rest_error!(other "Wrong arg type: {:?}: {:?}", vr, vt))
+                }
+                vpos += 1;
+            }
+        }
+    }
+    Ok(o)
+}
+
+#[test]
+fn test_pattern() {
+    let p = parse_uri_pattern("x1/$s/x2/$i");
+    let w = build_uri(&p, &[ValRef::Str("Vx1"), ValRef::Int(201)]).unwrap();
+    //println!("##### {}", w);
+    assert_eq!(w, "x1/Vx1/x2/201");
 }
 
 //-------------------------------------------------------------------------------------------------

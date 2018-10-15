@@ -1,4 +1,5 @@
-use ::*;
+use error::*;
+use std::error::Error;
 
 //--------------------------------------------------------------------------------------------------
 /// error type
@@ -25,7 +26,7 @@ impl<T> GOW<T> /*where T: Ser*/ {
         }
     }
 
-    pub fn error(e: &ZRError) -> GOW<T> {
+    pub fn error(e: &ZError) -> GOW<T> {
         GOW {
             ok: false,
             data: None,
@@ -34,12 +35,12 @@ impl<T> GOW<T> /*where T: Ser*/ {
     }
 }
 
-impl<T> From<ZRError> for GOW<T> {
-    fn from(e: ZRError) -> Self { GOW::error(&e) }
+impl<T> From<ZError> for GOW<T> {
+    fn from(e: ZError) -> Self { GOW::error(&e) }
 }
 
-impl<'t, T> From<&'t ZRError> for GOW<T> {
-    fn from(e: &'t ZRError) -> Self { GOW::error(e) }
+impl<'t, T> From<&'t ZError> for GOW<T> {
+    fn from(e: &'t ZError) -> Self { GOW::error(e) }
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -53,7 +54,7 @@ pub struct EW {
 }
 
 impl EW {
-    pub fn new(e: &ZRError) -> Self {
+    pub fn new(e: &ZError) -> Self {
         EW {
             ok: false,
             error: ET { message: e.description().to_owned(), detail: format!("{}", e) }
@@ -68,12 +69,12 @@ impl EW {
     }
 }
 
-impl From<ZRError> for EW {
-    fn from(e: ZRError) -> Self { EW::new(&e) }
+impl From<ZError> for EW {
+    fn from(e: ZError) -> Self { EW::new(&e) }
 }
 
-impl<'t> From<&'t ZRError> for EW {
-    fn from(e: &'t ZRError) -> Self { EW::new(e) }
+impl<'t> From<&'t ZError> for EW {
+    fn from(e: &'t ZError) -> Self { EW::new(e) }
 }
 
 /// generic output
