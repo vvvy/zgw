@@ -1,12 +1,10 @@
-use std::{self, error::Error, fmt::Display};
+use std::{self, borrow::Cow, error::Error, fmt::Display};
 use hyper;
 use hyper_tls;
 use mime;
 use serde_json;
 use http;
 use uri_scanner;
-
-pub use std::borrow::Cow;
 
 #[derive(Debug)]
 pub enum ZError {
@@ -20,25 +18,12 @@ pub enum ZError {
     UriScanner(uri_scanner::SErr),
     InvalidUri(http::uri::InvalidUri),
     InvalidUriParts(http::uri::InvalidUriParts),
+    AppHttp(http::StatusCode, Cow<'static, str>),
     Other(Cow<'static, str>)
 }
 
 
 impl Error for ZError {
-    /*fn description(&self) -> &str {
-        match self {
-            ZError::Hyper(e) => e.description(),
-            ZError::HyperHeaderToStr(e) => e.description(),
-            ZError::HyperTls(e) => e.description(),
-            ZError::MimeFromStr(e) => e.description(),
-            ZError::SerdeJson(e) => e.description(),
-            ZError::Http(e) => e.description(),
-            ZError::Io(e) => e.description(),
-            ZError::UriScanner(e) => e.description(),
-            ZError::Other(s) => s
-        }
-    }*/
-
     fn cause(&self) -> Option<&dyn Error> {
         match self {
             ZError::Hyper(e) => e.cause(),
@@ -51,6 +36,7 @@ impl Error for ZError {
             ZError::UriScanner(e) => e.cause(),
             ZError::InvalidUri(e) => e.cause(),
             ZError::InvalidUriParts(e) => e.cause(),
+            ZError::AppHttp(..) => None,
             ZError::Other(_) => None
         }
     }
@@ -70,6 +56,7 @@ impl Display for ZError {
             ZError::UriScanner(e) => write!(f, "(UriScanner): ").and_then(|_| e.fmt(f)),
             ZError::InvalidUri(e) => write!(f, "(InvalidUri): ").and_then(|_| e.fmt(f)),
             ZError::InvalidUriParts(e) => write!(f, "(InvalidUriParts): ").and_then(|_| e.fmt(f)),
+            ZError::AppHttp(s, m) => write!(f, "(AppHttp): {} {}", s, m),
             ZError::Other(s) => write!(f, "(Other): {}", s)
         }
     }
@@ -134,6 +121,8 @@ impl From<http::uri::InvalidUriParts> for ZError {
 
 #[macro_export]
 macro_rules! rest_error {
-    {other $e:expr} => { ZError::Other(Cow::from($e)) };
-    {other $($es:expr),+} => { ZError::Other(Cow::from(format!($($es),+))) };
+    {other $e:expr} => { ZError::Other(std::borrow::Cow::from($e)) };
+    {other $($es:expr),+} => { ZError::Other(std::borrow::Cow::from(format!($($es),+))) };
+    {http $sc:ident $es:expr} => { ZError::AppHttp(http::StatusCode::$sc, std::borrow::Cow::from($es)) };
+    {http $sc:ident $($es:expr),+} => { ZError::AppHttp(http::StatusCode::$sc, std::borrow::Cow::from(format!($($es),+))) };
 }

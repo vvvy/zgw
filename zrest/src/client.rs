@@ -6,7 +6,8 @@ use hyper::{
     client::{Client, ResponseFuture, HttpConnector}
 };
 use hyper_tls::HttpsConnector;
-use http::{self, request::Builder as RequestBuilder, method::Method, uri::{Parts, PathAndQuery}};
+use http::{self, request::Builder as RequestBuilder, method::Method, uri::PathAndQuery};
+use mime::Mime;
 use auth;
 use error::*;
 use common::*;
@@ -50,15 +51,21 @@ fn test_uri_pattern() {
     assert_eq!(u.to_string(), "https://www.google.com/a/b/x1/Vx1/x2/15?p=q")
 }
 
+pub fn empty(_: Option<&Mime>, _: Option<u64>) -> InputType { InputType::Empty }
+pub fn typed(_: Option<&Mime>, _: Option<u64>) -> InputType { InputType::Typed }
+pub fn raw(_: Option<&Mime>, _: Option<u64>) -> InputType { InputType::Raw }
+pub fn discard(_: Option<&Mime>, _: Option<u64>) -> InputType { InputType::Discard }
+pub fn stream(_: Option<&Mime>, _: Option<u64>) -> InputType { InputType::Stream }
+
 #[inline]
 fn http_process_response<R>(
     rf: ResponseFuture,
-    parse_as: InputType
+    prefetch: impl FnOnce(Option<&Mime>, Option<u64>) -> InputType + Send
 ) -> impl Future<Item=Input<R>, Error=ZError> + Send
     where R: Des + Send + 'static {
     rf
         .map_err(|err| err.into())
-        .map(|r| parse_response(r, parse_as))
+        .and_then(move |r| response_parser(prefetch)(r))
 }
 
 #[inline]
@@ -108,58 +115,61 @@ impl ZClient
     }
 
     #[inline]
-    fn create_request(&self, method: http::method::Method, uri: Uri) -> RequestBuilder {
+    fn create_request(&self, method: Method, uri: Uri) -> RequestBuilder {
         let mut r = RequestBuilder::new();
         r.method(method).uri(uri);
         (self.auth)(&mut r);
         r
     }
 
-    pub fn do_with_no_input<R>(&self, method: Method, uri: Uri)
-                            -> impl FnOnce(InputType) -> Box<dyn Future<Item=Input<R>, Error=ZError> + Send> + Send
+    pub fn do_with_no_input<R>(&self, method: Method, uri: Uri, prefetch: impl FnOnce(Option<&Mime>, Option<u64>) -> InputType + Send)
+                            -> impl Future<Item=Input<R>, Error=ZError> + Send
         where R: Des + Send + 'static
     {
         let r = self.create_request(method, uri);
         let f = http_empty_body(r)
             .map(|r| self.endpoint.request_raw(r));
-        |parse_as|
-            Box::new(futures::future::result(f).and_then(|e|
-                http_process_response(e, parse_as)
-            ))
+        futures::future::result(f).and_then(move |rf|
+            http_process_response(rf, prefetch)
+        )
     }
 
-    pub fn do_with_input<Q, R>(&self, method: Method, uri: Uri, q: Output<Q>)
-                               -> impl FnOnce(InputType) -> Box<dyn Future<Item=Input<R>, Error=ZError> + Send> + Send
+    pub fn do_with_input<Q, R>(&self, method: Method, uri: Uri, q: Output<Q>, prefetch: impl FnOnce(Option<&Mime>, Option<u64>) -> InputType + Send)
+                               -> impl Future<Item=Input<R>, Error=ZError> + Send
         where Q: Ser,
               R: Des + Send + 'static
     {
         let r = self.create_request(method, uri);
         let f = build_request(q, r)
             .map(|r| self.endpoint.request_raw(r));
-        |parse_as|
-            Box::new(futures::future::result(f).and_then(|e|
-                http_process_response(e, parse_as)
-            ))
+        futures::future::result(f).and_then(move |rf|
+            http_process_response(rf, prefetch)
+        )
     }
 
-    pub fn get<R>(&self, uri: Uri)
-                  -> impl FnOnce(InputType) -> Box<dyn Future<Item=Input<R>, Error=ZError> + Send> + Send
+    pub fn get<R>(&self, uri: Uri, prefetch: impl FnOnce(Option<&Mime>, Option<u64>) -> InputType + Send)
+                  -> impl Future<Item=Input<R>, Error=ZError> + Send
         where R: Des + Send + 'static
     {
-        self.do_with_no_input(Method::GET, uri)
+        self.do_with_no_input(Method::GET, uri, prefetch)
     }
-    pub fn post<Q, R>(&self, uri: Uri, q: Output<Q>) -> impl FnOnce(InputType) -> Box<dyn Future<Item=Input<R>, Error=ZError> + Send> + Send
+
+    pub fn post<Q, R>(&self, uri: Uri, q: Output<Q>, prefetch: impl FnOnce(Option<&Mime>, Option<u64>) -> InputType + Send)
+        -> impl Future<Item=Input<R>, Error=ZError> + Send
         where Q: Ser,
               R: Des + Send + 'static
     {
-        self.do_with_input(Method::POST, uri, q)
+        self.do_with_input(Method::POST, uri, q, prefetch)
     }
-    pub fn put<Q, R>(&self, uri: Uri, q: Output<Q>) -> impl FnOnce(InputType) -> Box<dyn Future<Item=Input<R>, Error=ZError> + Send> + Send
+
+    pub fn put<Q, R>(&self, uri: Uri, q: Output<Q>, prefetch: impl FnOnce(Option<&Mime>, Option<u64>) -> InputType + Send)
+        -> impl Future<Item=Input<R>, Error=ZError> + Send
         where Q: Ser,
               R: Des + Send + 'static
     {
-        self.do_with_input(Method::PUT, uri, q)
-    }}
+        self.do_with_input(Method::PUT, uri, q, prefetch)
+    }
+}
 
 //--------------------------------------------------------------------------------------------------
 
@@ -169,40 +179,65 @@ mod client_tests {
     use futures::{future, Future};
     use tokio::runtime::Runtime;
 
-    fn f_wait<I>(f: impl FnOnce(InputType) -> Box<dyn Future<Item=Input<I>, Error=ZError> + Send> + Send) -> Result<I, ZError>
+    fn f_wait<I>(f: impl Future<Item=Input<I>, Error=ZError> + Send + 'static) -> Result<I, ZError>
         where I: Des + Send + 'static
     {
-        let g = f(InputType::Typed).and_then(|input|
+        let g = f.and_then(|input|
             if let Input::Typed(i) = input {
-                i
+                Ok(i)
             } else {
-                Box::new(future::err(rest_error!(other "invalid reply type")))
+                Err(rest_error!(other "invalid reply type"))
             }
         );
         Runtime::new().unwrap().block_on(g)
     }
 
+    #[derive(Debug, Serialize, Deserialize, PartialEq)]
+    struct Pub {
+        title: String,
+        body: String,
+        #[serde(rename="userId")]
+        user_id: i32,
+        id: i32
+    }
 
+    /*
     #[derive(Debug, Serialize, Deserialize, PartialEq)]
     struct R {
         operation: String,
         expression: String,
         result: String
-    }
+    }*/
     #[test]
     fn test_get_s() {
+        /*
         let uri = "https://newton.now.sh/factor/x%5E2-1".parse().unwrap();
         let cl = ZClient::new(&uri, None).unwrap();
-        let res = f_wait(cl.get::<R>(uri)).unwrap();
+        let res: R = f_wait(cl.get(uri, typed)).unwrap();
         assert_eq!(res , R {
             operation: "factor".to_string(),
             expression: "x^2-1".to_string(),
             result: "(x - 1) (x + 1)".to_string()
         });
         println!("{:?}", res);
+        */
+        let uri = "http://jsonplaceholder.typicode.com/posts/1".parse().unwrap();
+        let cl = ZClient::new(&uri, None).unwrap();
+        let res: Pub = f_wait(cl.get(uri, typed)).unwrap();
+        assert_eq!(res , Pub {
+            title: "sunt aut facere repellat provident occaecati excepturi optio reprehenderit".to_string(),
+            body: "\
+quia et suscipit\nsuscipit recusandae consequuntur expedita et cum
+reprehenderit molestiae ut ut quas totam
+nostrum rerum est autem sunt rem eveniet architecto".to_string(),
+            user_id: 1,
+            id: 1
+        });
+        println!("{:?}", res);
+
     }
 
-
+/*
     #[derive(Debug, Serialize, Deserialize, PartialEq)]
     struct PubReq {
         title: String,
@@ -211,25 +246,17 @@ mod client_tests {
         user_id: i32,
         id: i32
     }
-
-    #[derive(Debug, Serialize, Deserialize, PartialEq)]
-    struct PubResp {
-        title: String,
-        body: String,
-        #[serde(rename="userId")]
-        user_id: i32,
-        id: i32
-    }
-
+*/
     #[test]
     fn test_post_s() {
         let uri = "http://jsonplaceholder.typicode.com/posts".parse().unwrap();
         let cl = ZClient::new(&uri, None).unwrap();
-        let res = f_wait(cl.post::<PubReq, PubResp>(
+        let res: Pub = f_wait(cl.post(
             uri,
-            Output::Typed(&PubReq { title: "ABC".to_string(), body: "DEF".to_string(), user_id: 111, id: 1001 })
+            Output::Typed(Pub { title: "ABC".to_string(), body: "DEF".to_string(), user_id: 111, id: 1001 })
+            , typed
         )).unwrap();
-        assert_eq!(res , PubResp {
+        assert_eq!(res , Pub {
             title: "ABC".to_string(), body: "DEF".to_string(), user_id: 111,
             id: 1001
         });
@@ -240,11 +267,12 @@ mod client_tests {
     fn test_post() {
         let uri = "http://jsonplaceholder.typicode.com/posts".parse().unwrap();
         let cl = ZClient::new(&uri, None).unwrap();
-        let res = f_wait(cl.post::<PubReq, PubResp>(
+        let res: Pub = f_wait(cl.post(
             uri,
-            Output::Typed(&PubReq { title: "ABC".to_string(), body: "DEF".to_string(), user_id: 111, id: 1002 })
+            Output::Typed(Pub { title: "ABC".to_string(), body: "DEF".to_string(), user_id: 111, id: 1002 })
+            , typed
         )).unwrap();
-        assert_eq!(res , PubResp {
+        assert_eq!(res , Pub {
             title: "ABC".to_string(), body: "DEF".to_string(), user_id: 111,
             id: 1002
         });

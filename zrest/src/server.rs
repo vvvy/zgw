@@ -1,62 +1,32 @@
-use std::net::SocketAddr;
+use std::{
+    fmt::Display,
+    net::SocketAddr,
+    sync::Arc
+};
 use tls_server;
 use tokio_tcp::TcpListener;
 use futures::{Future, Stream, future};
 use hyper::{
     self,
-    Body, Request, Response, //Method,  StatusCode,
+    Body, Request, Response, Method,  //StatusCode,
+    header::SERVER,
     server::Server,
-    service::service_fn,
+    service::{service_fn, Service, NewService},
     rt
 };
 use http::response::Builder as ResponseBuilder;
-use serde_json;
+use serde_json::{
+    self,
+    Value as JsValue
+};
 use serde;
 use mime;
 
 use common::*;
 use auth::*;
 use error::*;
-
-fn http_process_request<Q>(
-    req: Request<Body>
-) -> impl Future<Item=Q, Error=ZError> + Send
-    where Q: serde::de::DeserializeOwned + Send {
-    use std::str::FromStr;
-    let m = req.headers()
-        .get(hyper::header::CONTENT_TYPE)
-        .map(|s| s.to_str().map(|x| mime::Mime::from_str(x)));
-    let r = future::result(match m {
-        Some(Ok(Ok(ref ct))) if ct.type_() == mime::APPLICATION && ct.subtype() == mime::JSON =>
-            Ok(req),
-        Some(Ok(Ok(ref ct))) =>
-            Err(rest_error!(other "invalid content type `{}`", ct)),
-        Some(Ok(Err(ect))) =>
-            Err(ect.into()),
-        Some(Err(ect)) =>
-            Err(ect.into()),
-        None =>
-            Err(rest_error!(other "no content type found (application/json required)"))
-    });
-    r.and_then(|req|
-        req.into_body().concat2().map_err(|err| err.into())
-    )
-        .and_then(|body|
-            serde_json::from_slice(&body).map_err(|err| err.into())
-        )
-}
-
-fn http_attach_response_data<R>(mut rsp: ResponseBuilder, r: &R)-> Result<Response<Body>, ZError>
-    where R: serde::ser::Serialize
-{
-    rsp.header(hyper::header::CONTENT_TYPE, mime::APPLICATION_JSON.as_ref());
-    let data =  serde_json::to_vec(r)?;
-    //let dlen = data.len();
-    //req.header(hyper::header::CONTENT_LENGTH, dlen as u64);
-    let body: Body = data.into();
-    let rv = rsp.body(body)?;
-    Ok(rv)
-}
+use router::*;
+use data_io::*;
 
 pub enum ServerType {
     HTTP,
@@ -64,197 +34,417 @@ pub enum ServerType {
 }
 
 impl ServerType {
-    pub fn run_raw<K>(self, addr: SocketAddr, auth: BasicAuth, handler: impl Fn() -> K + Send + 'static) -> Result<(), ZError> where
-        K: Fn(Request<Body>) -> BoxFut + Send + 'static
+    pub fn run_service<K>(self, addr: &SocketAddr, new_service: K) -> Result<(), ZError> where
+        K: NewService<ReqBody=Body, ResBody=Body, Error=ZError> + Send + 'static,
+        <<K as NewService>::Service as Service>::Future: Send,
+        <K as NewService>::Future: Send,
+        <K as NewService>::Service: Send,
+        <K as NewService>::InitError: Display
     {
-        let srv = TcpListener::bind(&addr).map_err(|e| Into::<ZError>::into(e))?;
-        let new_service=
-            move || service_fn({
-                let auth_handler = auth.clone().run_server(handler());
-                move |req| {
-                    info!("Incoming req:: {:?}", req);
-                    auth_handler(req)
-                }
-            });
-        info!("Listening on {}", addr);
         match self {
             ServerType::HTTPS { cert, passwd } => {
                 let tls_cx = tls_server::create_tls_cx(&cert, &passwd)?;
+                let srv = TcpListener::bind(addr)?;
                 let http_server = tls_server::TlsServer::create(srv, tls_cx, new_service);
+                info!("(HTTPS) Listening on {}", addr);
                 rt::run(http_server);
                 Ok(())
             }
             ServerType::HTTP => {
-                let http_server = Server::bind(&addr)
+                let http_server = Server::bind(addr)
                     .serve(new_service)
                     .map_err(|e| error!("Error creating service: {}", e))
                 ;
+                info!("Listening on {}", addr);
                 rt::run(http_server);
                 Ok(())
             }
         }
     }
 
-    pub fn run<K, L, M, Q, R>(self, addr: SocketAddr, auth: BasicAuth, handler: impl Fn() -> K + Send + 'static) -> Result<(), ZError> where
-        K: Fn(&str) -> L + Send + 'static,
-        L: Fn(Q) -> M + Send + 'static,
-        M: Future<Item=R, Error=ZError> + Send + 'static,
-        Q: serde::de::DeserializeOwned + Send + 'static,
-        R: serde::ser::Serialize + Send
+    pub fn run_pipeline_factory(self, addr: &SocketAddr, handler: impl Fn() -> Pipeline + Send + 'static) -> Result<(), ZError>
     {
-        self.run_raw(addr, auth, move || {
-            let k = handler();
-            move |req: Request<Body>| {
-                let l = k(req.uri().path());
-                Box::new(http_process_request(req)
-                    .and_then(move |q| l(q))
-                    .and_then(|r: R| {
-                        future::result(http_attach_response_data(ResponseBuilder::new(), &r))
-                    }))
-            }
-        })
+        let new_service=
+            move || service_fn({
+                let h = handler();
+                move |req| {
+                    info!("Incoming req:: {:?}", req);
+                    h.apply(req, QAttr::new())
+                }
+            });
+        self.run_service(addr, new_service)
+    }
+
+    pub fn run_transform(self, addr: &SocketAddr, pt: impl PipelineTransform) -> Result<(), ZError> {
+        let h = move || pt.apply(Pipeline::default());
+        self.run_pipeline_factory(addr, h)
     }
 }
 
+//--------------------------------------------------------------------------------------------------
+const SERVER_HEADER_VALUE: &'static str = concat!("zrest/", env!("CARGO_PKG_VERSION"));
 
+#[inline]
+fn resp_stub() -> ResponseBuilder {
+    let mut rv = Response::builder();
+    rv.header(SERVER, SERVER_HEADER_VALUE);
+    rv
+}
 
+pub struct AsyncActionFn<Cx> {
+    h: Box<Fn(&Cx, Vec<Val>, Request<Body>) -> BFR + Send + Sync>
+}
 
+impl<Cx> AsyncActionFn<Cx> {
+    fn new(a: impl Fn(&Cx, Vec<Val>, Request<Body>) -> BFR + Send + Sync + 'static) -> AsyncActionFn<Cx> {
+        AsyncActionFn { h: Box::new(a) }
+    }
+    pub fn constant<O: Ser + Send + Sync + 'static>(o: O) -> AsyncActionFn<Cx> {
+        Self::new(move |_, _, _| Box::new(future::result(build_json_response(&o, resp_stub()))))
+    }
+    pub fn error(text: &'static str) -> AsyncActionFn<Cx> {
+        Self::new(move |_, _, _| Box::new(future::err(rest_error!(other "{}", text))))
+    }
 
+    /// asynchronous json-to-json
+    pub fn async_jj<I, O, E, F, G>(e: E) -> AsyncActionFn<Cx> where
+        E: Fn(&Cx, Vec<Val>) -> F + Send + Sync + 'static,
+        F: FnOnce(I) -> G + Send + 'static,
+        G: Future<Item=O, Error=ZError> + Send + 'static,
+        Cx: Sync,
+        I: Des + Send + 'static,
+        O: Ser + Send + 'static
+    {
+        Self::new(
+            move |cx: &Cx, vals: Vec<Val>, r: Request<Body>| {
+                let f = e(cx, vals);
+                Box::new(
+                    parse_as_json::<I>(r.into_body())
+                        .and_then(move |v| f(v))
+                        .and_then(|o: O| future::result(build_json_response(&o, resp_stub())))
+                )
+            }
+        )
+    }
+
+    /// synchronous json-to-json
+    pub fn sync_jj<I, O, E, F>(e: E) -> AsyncActionFn<Cx> where
+        E: Fn(&Cx, Vec<Val>) -> F + Send + Sync + 'static,
+        F: FnOnce(I) -> ZResult<O> + Send + 'static,
+        Cx: Sync,
+        I: Des + Send + 'static,
+        O: Ser + Send + 'static
+    {
+        Self::new(
+            move |cx: &Cx, vals: Vec<Val>, r: Request<Body>| {
+                let f = e(cx, vals);
+                Box::new(
+                    parse_as_json::<I>(r.into_body())
+                        .and_then(move |v| f(v))
+                        .and_then(|o: O| future::result(build_json_response(&o, resp_stub())))
+                )
+            }
+        )
+    }
+
+    /// asynchronous json-to-any
+    pub fn async_ja<I, O, E, F, G>(e: E) -> AsyncActionFn<Cx> where
+        E: Fn(&Cx, Vec<Val>) -> F + Send + Sync + 'static,
+        F: FnOnce(I) -> G + Send + 'static,
+        G: Future<Item=Output<O>, Error=ZError> + Send + 'static,
+        Cx: Sync,
+        I: Des + Send + 'static,
+        O: Ser + Send + 'static
+    {
+        Self::new(
+            move |cx: &Cx, vals: Vec<Val>, r: Request<Body>| {
+                let f = e(cx, vals);
+                Box::new(
+                    parse_as_json::<I>(r.into_body())
+                        .and_then(move |v| f(v))
+                        .and_then(|o: Output<O>| future::result(build_response(o, resp_stub())))
+                )
+            }
+        )
+    }
+
+    /// asynchronous any-to-any
+    pub fn async<I, O, E, F, G>(e: E) -> AsyncActionFn<Cx> where
+        E: Fn(&Cx, Vec<Val>) -> ZResult<(F, InputType)> + Send + Sync + 'static,
+        F: FnOnce(Input<I>) -> G + Send + 'static,
+        G: Future<Item=Output<O>, Error=ZError> + Send + 'static,
+        Cx: Sync,
+        I: Des + Send + 'static,
+        O: Ser + Send + 'static
+    {
+        Self::new(
+            move |cx: &Cx, vals: Vec<Val>, r: Request<Body>| {
+                match e(cx, vals) {
+                    Ok((f, input_type)) =>
+                        Box::new(
+                            parse::<I>(r.into_body(), input_type)
+                                .and_then(move |v| f(v))
+                                .and_then(|o: Output<O>| future::result(build_response(o, resp_stub())))
+                        ),
+                    Err(e) =>
+                        Box::new(future::err(e))
+                }
+
+            }
+        )
+    }
+}
+
+pub struct AAF<Cx, I, O> {
+    _t_cx: std::marker::PhantomData<Cx>,
+    _t_i: std::marker::PhantomData<I>,
+    _t_o: std::marker::PhantomData<O>,
+}
+
+impl<Cx, I, O> AAF<Cx, I, O> where
+    Cx: Sync,
+    I: Des + Send + 'static,
+    O: Ser + Send + 'static
+{
+    /// asynchronous json-to-json
+    pub fn async_jj<E, F, G>(e: E) -> AsyncActionFn<Cx> where
+        E: Fn(&Cx, Vec<Val>) -> F + Send + Sync + 'static,
+        F: FnOnce(I) -> G + Send + 'static,
+        G: Future<Item=O, Error=ZError> + Send + 'static
+    {
+        AsyncActionFn::new(
+            move |cx: &Cx, vals: Vec<Val>, r: Request<Body>| {
+                let f = e(cx, vals);
+                Box::new(
+                    parse_as_json::<I>(r.into_body())
+                        .and_then(move |v| f(v))
+                        .and_then(|o: O| future::result(build_json_response(&o, resp_stub())))
+                )
+            }
+        )
+    }
+
+    /// synchronous json-to-json
+    pub fn sync_jj<E, F>(e: E) -> AsyncActionFn<Cx> where
+        E: Fn(&Cx, Vec<Val>) -> F + Send + Sync + 'static,
+        F: FnOnce(I) -> ZResult<O> + Send + 'static
+    {
+        AsyncActionFn::new(
+            move |cx: &Cx, vals: Vec<Val>, r: Request<Body>| {
+                let f = e(cx, vals);
+                Box::new(
+                    parse_as_json::<I>(r.into_body())
+                        .and_then(move |v| f(v))
+                        .and_then(|o: O| future::result(build_json_response(&o, resp_stub())))
+                )
+            }
+        )
+    }
+
+    /// asynchronous json-to-any
+    pub fn async_ja<E, F, G>(e: E) -> AsyncActionFn<Cx> where
+        E: Fn(&Cx, Vec<Val>) -> F + Send + Sync + 'static,
+        F: FnOnce(I) -> G + Send + 'static,
+        G: Future<Item=Output<O>, Error=ZError> + Send + 'static
+    {
+        AsyncActionFn::new(
+            move |cx: &Cx, vals: Vec<Val>, r: Request<Body>| {
+                let f = e(cx, vals);
+                Box::new(
+                    parse_as_json::<I>(r.into_body())
+                        .and_then(move |v| f(v))
+                        .and_then(|o: Output<O>| future::result(build_response(o, resp_stub())))
+                )
+            }
+        )
+    }
+
+    /// asynchronous any-to-any
+    pub fn async<E, F, G>(e: E) -> AsyncActionFn<Cx> where
+        E: Fn(&Cx, Vec<Val>) -> ZResult<(F, InputType)> + Send + Sync + 'static,
+        F: FnOnce(Input<I>) -> G + Send + 'static,
+        G: Future<Item=Output<O>, Error=ZError> + Send + 'static
+    {
+        AsyncActionFn::new(
+            move |cx: &Cx, vals: Vec<Val>, r: Request<Body>| {
+                match e(cx, vals) {
+                    Ok((f, input_type)) =>
+                        Box::new(
+                            parse::<I>(r.into_body(), input_type)
+                                .and_then(move |v| f(v))
+                                .and_then(|o: Output<O>| future::result(build_response(o, resp_stub())))
+                        ),
+                    Err(e) =>
+                        Box::new(future::err(e))
+                }
+
+            }
+        )
+    }
+}
+
+pub struct ZService<Cx> {
+    rt: RTree<AsyncActionFn<Cx>>,
+    cx: Cx
+}
+
+impl<Cx> ZService<Cx> {
+    pub fn new(builder: Builder<AsyncActionFn<Cx>>,
+               failure_action: AsyncActionFn<Cx>,
+               cx: Cx)
+               -> Result<Self, ZError>
+    {
+        RTree::build(builder, failure_action)
+            .map(|rt| ZService { rt, cx })
+    }
+
+    fn handle(&self, req: Request<Body>, qattr: QAttr) -> BFR {
+        let ct = extract_content_type_from_request(&req);
+
+        let r = ct.and_then(|ct| {
+            let mct = match (req.method(), ct.as_ref()) {
+                (&Method::GET, None) => MCTR::Get,
+                (&Method::POST, Some(ct)) => MCTR::Post(ct),
+                (&Method::PUT, Some(ct)) => MCTR::Put(ct),
+                (&Method::DELETE, None) => MCTR::Delete,
+                _ => MCTR::Other
+            };
+            self.rt.run(req.uri().path(), mct)
+        });
+
+        match r {
+            Ok((rh, vars)) => (rh.h)(&self.cx, vars, req),
+            Err(e) => Box::new(future::err(e))
+        }
+    }
+
+    pub fn run(self, addr: &SocketAddr, st: ServerType) -> Result<(), ZError> where
+        Cx: Sync + Send + 'static
+    {
+        st.run_transform(addr, (self.transform(), FormatErrors))
+    }
+
+    pub fn transform(self) -> ZServiceTransform<Cx> {
+        ZServiceTransform::new(self)
+    }
+}
+
+pub struct ZServiceTransform<Cx> {
+    s: Arc<ZService<Cx>>
+}
+
+impl<Cx> ZServiceTransform<Cx> {
+    pub fn new(svc: ZService<Cx>) -> ZServiceTransform<Cx> {
+        ZServiceTransform { s: Arc::new(svc) }
+    }
+}
+
+impl<Cx> PipelineTransform for ZServiceTransform<Cx> where Cx: Send + Sync + 'static{
+    fn apply(&self, input: Pipeline) -> Pipeline {
+        let s = self.s.clone();
+        Pipeline::new(move |req, qattr| s.handle(req, qattr))
+    }
+}
+
+impl<Cx> Service for ZService<Cx>
+{
+    type ReqBody = Body;
+    type ResBody = Body;
+    type Error = ZError;
+    type Future = Box<Future<Item=Response<Self::ResBody>, Error=Self::Error>>;
+
+    fn call(&mut self, req: Request<Body>) -> Self::Future {
+        self.handle(req, QAttr::new())
+    }
+}
+
+/*
+#[macro_export]
+macro_rules! error_action(
+    { $s:expr } => { AsyncActionFn::error(||EW::new_s($s.to_owned(), "".to_owned())) };
+    { $s:expr, $d:expr } => { AsyncActionFn::error::<EW, _>(||EW::new_s($s.to_owned(), $d.to_owned())) };
+);
+
+macro_rules! z_action {
+    { [$vt:ty] => ($o:ty, $e:ty) { $b:expr } } => { AsyncActionFn::v_r::<$vt, $o, $e, _>($b) };
+    { [$vt:ty] $i:ty => ($o:ty, $e:ty) { $b:expr } } => { AsyncActionFn::vq_r::<$vt, $i, $o, $e, _>($b) };
+}
+*/
 
 //--------------------------------------------------------------------------------------------------
-/*
+
 #[cfg(test)]
 mod server_tests {
-    use hyper::server::Http;
-    use hyper::server::{Service, NewService};
+    //use hyper::server::{Service, NewService};
     use futures::sync::oneshot::*;
     use futures::Future;
     use super::*;
+    use client::*;
+    use tokio::runtime::Runtime;
+
+    fn f_wait<I>(f: impl Future<Item=Input<I>, Error=ZError> + Send + 'static) -> Result<I, ZError>
+        where I: Des + Send + 'static
+    {
+        let g =
+            f.and_then(|input|
+                if let Input::Typed(i) = input {
+                    Ok(i)
+                } else {
+                    Err(rest_error!(other "invalid reply type"))
+                }
+            );
+        Runtime::new().unwrap().block_on(g)
+    }
+
+    #[test]
+    fn test_server_raw() {
+        extern crate env_logger;
+        let _ = env_logger::try_init();
+
+        fn convert_vars(vars: Vec<Val>) -> JsValue {
+            vars.into_iter().map(|val| match val {
+                Val::Str(s) => json!({"str" : s}),
+                Val::Int(i) => json!({"int" : i}),
+                Val::Float(f) => json!({"float" : f}),
+            }).collect()
+        }
+
+        let (snd, recv) = channel::<()>();
+        let mut t = ::std::thread::spawn(|| {
+
+            let b = route_builder!(AsyncActionFn<()>,
+                "v0/static" => AsyncActionFn::<()>::constant(json!({"static":"true", "message": "v0/static"}))
+                //"v0/str/$/a" => AsyncActionFn::v_r::<String, JsValue, JsValue, _>(|s| Ok(json!({"op":"a", "type": "str", "vars": [{"str" : s}] }))),
+                //"v0/str/$/a" => z_action!([String] => (JsValue, JsValue) { |s| Ok(json!({"op":"a", "type": "str", "vars": [{"str" : s}] })) }),
+                //"v0/mixed/$i/$f/a" => AsyncActionFn::v_r::<(i64, f64), JsValue, JsValue, _ >(|(i, f)| Ok(json!({"op":"a", "type": "mixed", "vars": [{"int" : i}, {"float" : f}] })))
+            );
+
+            let svc = ZService::new(b, AsyncActionFn::error("routing failed"), ()).unwrap();
+
+            let addr = "127.0.0.1:3000".parse().unwrap();
+            svc.run(&addr, ServerType::HTTP).unwrap()
+        });
+        //t.join();
+
+        let cl = ZClient::new(&"http://127.0.0.1:3000/v0/static".parse().unwrap(), None).unwrap();
+
+        let res: JsValue = f_wait(cl.get("http://127.0.0.1:3000/v0/static".parse().unwrap(), typed)).unwrap();
+        assert_eq!(res, json!({"static":"true", "message": "v0/static"}));
+        //println!("SERVER: {:?}", res);
+
+        //let res: JsValue = f_wait(cl.get("http://127.0.0.1:3000/v0/str/abcd/a".parse().unwrap(), typed)).unwrap();
+        //assert_eq!(res, json!({"op":"a", "type": "str", "vars": [{"str" : "abcd"}] }));
+        //println!("SERVER: {:?}", res);
+
+        //let res: JsValue = f_wait(cl.get("http://127.0.0.1:3000/v0/mixed/10/0.25/a".parse().unwrap(), typed)).unwrap();
+        //assert_eq!(res, json!({"op":"a", "type": "mixed", "vars": [{"int" : 10}, {"float" : 0.25}] }));
+        //println!("SERVER: {:?}", res);
+
+        //std::thread::sleep_ms(60000);
+        snd.send(()).unwrap();
+    }
 
     /*
-    #[test]
-    fn test_server_raw() {
-        fn convert_vars(vars: Vec<Val>) -> JsValue {
-            vars.into_iter().map(|val| match val {
-                Val::Str(s) => json!({"str" : s}),
-                Val::Int(i) => json!({"int" : i}),
-                Val::Float(f) => json!({"float" : f}),
-            }).collect()
-        }
-
-        let (snd, recv) = channel::<()>();
-        std::thread::spawn(|| {
-
-            let b = route_builder!(
-                AsyncActionFn<JsValue, JsValue>,
-                "v0/static" => const_action!(Output::Typed(json!({"static":"true", "message": "v0/static"}))),
-                "v0/str/$/a" => no_input_action!(|vars: Vec<Val>| Output::Typed(json!({"op":"a", "type": "str", "vars": convert_vars(vars) }))),
-                "v0/mixed/$i/$f/a" => no_input_action!(|vars: Vec<Val>| Output::Typed(json!({"op":"a", "type": "mixed", "vars": convert_vars(vars) })))
-            );
-
-            let svc = ZService::new(b, Box::new(error_action!("routing failed"))).unwrap();
-
-            let addr = "127.0.0.1:3000".parse().unwrap();
-            let server = Http::new().bind(&addr, to_new_service!(svc)).unwrap();
-            server.run_until(recv.map_err(|_canceled| ()))
-        });
-
-        let mut cl = ZHttpsClient::new(1).unwrap();
-
-        let res = cl.get::<JsValue>("http://127.0.0.1:3000/v0/static".parse().unwrap()).unwrap();
-        assert_eq!(res, json!({"static":"true", "message": "v0/static"}));
-        //println!("SERVER: {:?}", res);
-
-        let res = cl.get::<JsValue>("http://127.0.0.1:3000/v0/str/abcd/a".parse().unwrap()).unwrap();
-        assert_eq!(res, json!({"op":"a", "type": "str", "vars": [{"str" : "abcd"}] }));
-        //println!("SERVER: {:?}", res);
-
-        let res = cl.get::<JsValue>("http://127.0.0.1:3000/v0/mixed/10/0.25/a".parse().unwrap()).unwrap();
-        assert_eq!(res, json!({"op":"a", "type": "mixed", "vars": [{"int" : 10}, {"float" : 0.25}] }));
-        //println!("SERVER: {:?}", res);
-
-        //std::thread::sleep_ms(60000);
-        snd.send(()).unwrap();
-    }
-
-
-    #[test]
-    fn test_server_typed() {
-        #[derive(Serialize, Deserialize, Debug, PartialEq)]
-        struct TIO {
-            s: String,
-            i: i64
-        }
-
-        let (snd, recv) = channel::<()>();
-        std::thread::spawn(|| {
-
-            let b = route_builder!(
-                AsyncActionFn<TIO, GOW<TIO>>,
-                "v0/default" => const_action!(Output::Typed(GOW::ok(TIO { s: "default".to_owned(), i: 0 }))),
-                "v0/mult/$i" => typed_input_action!(|vars: Vec<Val>, _| Output::Typed(GOW::ok(TIO { s: /*input.s +*/ "_multiplied".to_owned(), i: 1/*input.i*/ })))
-            );
-
-            let svc = ZService::new(b, Box::new(error_action!("routing failed"))).unwrap();
-
-            let addr = "127.0.0.1:3001".parse().unwrap();
-            let server = Http::new().bind(&addr, to_new_service!(svc)).unwrap();
-            server.run_until(recv.map_err(|_canceled| ()))
-        });
-
-        let mut cl = ZHttpsClient::new(1).unwrap();
-        let res = cl.get::<GOW<TIO>>("http://127.0.0.1:3001/v0/default".parse().unwrap()).unwrap();
-        assert_eq!(res, GOW::ok(TIO { s: "default".to_owned(), i: 0 }));
-        println!("### {:?}", res);
-
-        snd.send(()).unwrap();
-    }
-    */
-    #[test]
-    fn test_server_raw() {
-        fn convert_vars(vars: Vec<Val>) -> JsValue {
-            vars.into_iter().map(|val| match val {
-                Val::Str(s) => json!({"str" : s}),
-                Val::Int(i) => json!({"int" : i}),
-                Val::Float(f) => json!({"float" : f}),
-            }).collect()
-        }
-
-        let (snd, recv) = channel::<()>();
-        std::thread::spawn(|| {
-
-            let b = route_builder!(AsyncActionFn,
-                "v0/static" => AsyncActionFn::constant::<JsValue, JsValue, _>(|| json!({"static":"true", "message": "v0/static"})),
-                //"v0/str/$/a" => AsyncActionFn::v_r::<String, JsValue, JsValue, _>(|s| Ok(json!({"op":"a", "type": "str", "vars": [{"str" : s}] }))),
-                "v0/str/$/a" => z_action!([String] => (JsValue, JsValue) { |s| Ok(json!({"op":"a", "type": "str", "vars": [{"str" : s}] })) }),
-                "v0/mixed/$i/$f/a" => AsyncActionFn::v_r::<(i64, f64), JsValue, JsValue, _ >(|(i, f)| Ok(json!({"op":"a", "type": "mixed", "vars": [{"int" : i}, {"float" : f}] })))
-            );
-
-            let svc = ZService::new(b, error_action!("routing failed")).unwrap();
-
-            let addr = "127.0.0.1:3000".parse().unwrap();
-            let server = Http::new().bind(&addr, to_new_service!(svc)).unwrap();
-            server.run_until(recv.map_err(|_canceled| ()))
-        });
-
-        let mut cl = ZHttpsClient::new(1).unwrap();
-
-        let res = cl.get::<JsValue>("http://127.0.0.1:3000/v0/static".parse().unwrap()).unwrap();
-        assert_eq!(res, json!({"static":"true", "message": "v0/static"}));
-        //println!("SERVER: {:?}", res);
-
-        let res = cl.get::<JsValue>("http://127.0.0.1:3000/v0/str/abcd/a".parse().unwrap()).unwrap();
-        assert_eq!(res, json!({"op":"a", "type": "str", "vars": [{"str" : "abcd"}] }));
-        //println!("SERVER: {:?}", res);
-
-        let res = cl.get::<JsValue>("http://127.0.0.1:3000/v0/mixed/10/0.25/a".parse().unwrap()).unwrap();
-        assert_eq!(res, json!({"op":"a", "type": "mixed", "vars": [{"int" : 10}, {"float" : 0.25}] }));
-        //println!("SERVER: {:?}", res);
-
-        //std::thread::sleep_ms(60000);
-        snd.send(()).unwrap();
-    }
-
     #[test]
     fn test_server_custom() {
         #[derive(Serialize, Deserialize, Debug, PartialEq)]
@@ -291,10 +481,10 @@ mod server_tests {
         println!("### {:?}", res);
         snd.send(()).unwrap();
     }
-
+    */
 }
 
-*/
+
 
 //--------------------------------------------------------------------------------------------------
 //--------------------------------------------------------------------------------------------------

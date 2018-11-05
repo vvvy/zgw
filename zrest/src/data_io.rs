@@ -1,10 +1,9 @@
 use common::*;
 use error::*;
-use futures::{Future, Stream, future};
+use futures::{future, Future, Stream};
 use hyper::{
     Response, Request, Body, Chunk,
-    header::{CONTENT_TYPE, HeaderValue},
-    HeaderMap
+    header::{CONTENT_TYPE, CONTENT_LENGTH, HeaderValue}
 };
 use http::{
     response::Builder as ResponseBuilder,
@@ -17,7 +16,75 @@ use serde_json::{
 };
 use std::str::FromStr;
 
+//--------------------------------------------------------------------------------------------------
 
+fn parse_content_type(content_type: Option<&HeaderValue>) -> ZResult<Option<Mime>> {
+    match content_type {
+        None =>
+            Ok(None),
+        Some(s) =>
+            s.to_str()
+                .map_err(|e| e.into())
+                .and_then(|x| Mime::from_str(x).map_err(|e| e.into()))
+                .map(|x| Some(x))
+    }
+}
+
+pub fn extract_content_type_from_request<B>(req: &Request<B>) -> ZResult<Option<Mime>> {
+    parse_content_type(req.headers().get(CONTENT_TYPE))
+}
+
+pub fn extract_content_type_from_response<B>(req: &Response<B>) -> ZResult<Option<Mime>> {
+    parse_content_type(req.headers().get(CONTENT_TYPE))
+}
+
+fn parse_content_length(content_length: Option<&HeaderValue>) -> ZResult<Option<u64>> {
+    match content_length {
+        None =>
+            Ok(None),
+        Some(s) =>
+            s.to_str()
+                .map_err(|e| e.into())
+                .and_then(|x| x.parse().map_err(|e| rest_error!(other "Unable to parse contents of Content-Length: {}", e)))
+                .map(|x| Some(x))
+    }
+}
+
+//--------------------------------------------------------------------------------------------------
+
+fn build_json<O>(o: &O) -> ZResult<Body> where O: Ser {
+    Ok(serde_json::to_vec(o)?.into())
+}
+
+pub fn build_json_request<O>(o: &O, mut r: RequestBuilder) -> ZResult<Request<Body>> where O: Ser {
+    build_json(o).and_then(|b|{
+        r.header(CONTENT_TYPE, APPLICATION_JSON.as_ref());
+        Ok(r.body(b)?)
+    })
+}
+
+pub fn build_json_response<O>(o: &O, mut r: ResponseBuilder) -> ZResult<Response<Body>> where O: Ser {
+    build_json(o).and_then(|b|{
+        r.header(CONTENT_TYPE, APPLICATION_JSON.as_ref());
+        Ok(r.body(b)?)
+    })
+}
+
+pub fn parse_as_json<I>(b: Body) -> impl Future<Item=I, Error=ZError> where
+    I: Des + Send + 'static
+{
+    b
+        .concat2()
+        .map_err(|err| err.into())
+        .and_then(|body|
+            serde_json::from_slice(&body).map_err(|err| err.into())
+        )
+}
+
+
+//----------------------------------------------------------------------------------------------------------------------
+
+#[derive(Copy, Clone)]
 pub enum InputType {
     /// Input MUST be empty
     Empty,
@@ -37,20 +104,28 @@ pub enum InputType {
     Discard
 }
 
-pub enum Input<I: Des> {
+pub enum Input<I> {
     Empty,
-    Raw(Box<Future<Item=JsValue, Error=ZError> + Send>),
-    Typed(Box<dyn Future<Item=I, Error=ZError> + Send>),
+    Raw(JsValue),
+    Typed(I),
     Stream(Box<dyn Stream<Item=Chunk, Error=ZError> + Send>),
     //Memory(Chunk),
     //File(Box<Path>),
     Error(ZError)
 }
 
-pub enum Output<'v, O: Ser + 'v> {
+impl<I: Des> From<ZError> for Input<I> {
+    fn from(e: ZError) -> Self { Input::Error(e) }
+}
+
+
+type BIF<I> = Box<dyn Future<Item=Input<I>, Error=ZError> + Send>;
+
+
+pub enum Output<O> {
     Empty,
-    Raw(&'v JsValue),
-    Typed(&'v O),
+    Raw(JsValue),
+    Typed(O),
     Stream(Box<dyn Stream<Item=Chunk, Error=ZError> + Send>, Mime),
     //Memory(Vec<u8>, mime::Mime),
     //File(Box<Path>, mime::Mime),
@@ -88,217 +163,72 @@ pub fn build_response<O>(o: Output<O>, mut r: ResponseBuilder) -> ZResult<Respon
 
 //--------------------------------------------------------------------------------------------------
 
-fn require_app_json_ct(hm: &HeaderMap<HeaderValue>) -> ZResult<()> {
-    let m: Option<ZResult<Mime>>= hm.get(CONTENT_TYPE).map(|s|
-        s.to_str()
-            .map_err(|e| e.into())
-            .and_then(|x| Mime::from_str(x).map_err(|e| e.into()))
-    );
-    match m {
-        Some(Ok(ref ct)) if ct.type_() == APPLICATION && ct.subtype() == JSON =>
-            Ok(()),
-        Some(Ok(ct)) =>
-            Err(rest_error!(other "invalid content type `{}`", ct)),
-        Some(Err(ect)) =>
-            Err(ect.into()),
-        None =>
-            Err(rest_error!(other "no content type found (application/json required)"))
-    }
-}
-
-fn parse_as_json<I>(hm: &HeaderMap<HeaderValue>, b: Body, typed: bool) -> Input<I> where
-    I: Des + Send + 'static {
-    let y =
-        future::result(require_app_json_ct(hm)).and_then(|_|
-            b.concat2().map_err(|err| err.into())
-        );
-    if typed {
-        Input::Typed(Box::new(y.and_then(|body| serde_json::from_slice(&body).map_err(|err| err.into()))))
-    } else {
-        Input::Raw(Box::new(y.and_then(|body| serde_json::from_slice(&body).map_err(|err| err.into()))))
-    }
-}
-
-
-pub fn parse<I>(hm: &HeaderMap<HeaderValue>, b: Body, parse_as: InputType) -> Input<I> where
+pub fn parse<I>(b: Body, parse_as: InputType) -> BIF<I> where
     I: Des + Send +  'static {
     use hyper::body::Payload;
     match parse_as {
         InputType::Empty =>
             if b.is_end_stream() {
-                Input::Empty
+                Box::new(future::ok(Input::Empty))
             } else {
-                Input::Error(rest_error!(other "Non-empty body where empty is expected"))
+                Box::new(future::err(rest_error!(other "Non-empty body where empty is expected")))
             }
-        InputType::Raw => parse_as_json(hm, b, false),
-        InputType::Typed => parse_as_json(hm, b, true),
-        InputType::Stream => Input::Stream(Box::new(b.map_err(|e| e.into()))),
-        InputType::Discard => Input::Empty
+        InputType::Raw => Box::new(parse_as_json( b).map(|v| Input::Raw(v))),
+        InputType::Typed => Box::new(parse_as_json( b).map(|v| Input::Typed(v))),
+        InputType::Stream => Box::new(future::ok(Input::Stream(Box::new(b.map_err(|e| e.into()))))),
+        InputType::Discard => Box::new(future::ok(Input::Empty))
     }
 }
 
-pub fn parse_request<I>(r: Request<Body>, parse_as: InputType) -> Input<I> where I: Des + Send + 'static {
-    let (parts, body) = r.into_parts();
-    parse(&parts.headers, body, parse_as)
+
+fn parser<I>(prefetch: impl FnOnce(Option<&Mime>, Option<u64>) -> InputType)
+    -> impl FnOnce(Result<Option<Mime>, ZError>, Result<Option<u64>, ZError>, Body) -> BIF<I>
+    where I: Des + Send + 'static {
+    |content_type, content_length, body| {
+        match (content_type, content_length) {
+            (Ok(content_type), Ok(content_length)) => {
+                let input_type = prefetch(content_type.as_ref(), content_length);
+                match (input_type, content_type) {
+                    (InputType::Typed, Some(ref ct)) | (InputType::Raw, Some(ref ct)) if ct.type_() == APPLICATION && ct.subtype() == JSON =>
+                        parse(body, input_type),
+                    (InputType::Typed, Some(ref ct)) | (InputType::Raw, Some(ref ct)) =>
+                        Box::new(future::err(rest_error!(other "invalid content type `{}`", ct))),
+                    _ =>
+                        parse(body, input_type)
+                }
+            },
+            (Err(e), _) | (_, Err(e)) =>
+                Box::new(future::err(e))
+        }
+    }
 }
-pub fn parse_response<I>(r: Response<Body>, parse_as: InputType) -> Input<I> where I: Des + Send + 'static {
-    let (parts, body) = r.into_parts();
-    parse(&parts.headers, body, parse_as)
+
+/// client-side response parser
+pub fn response_parser<I>(prefetch: impl FnOnce(Option<&Mime>, Option<u64>) -> InputType)
+    -> impl FnOnce(Response<Body>) -> BIF<I> where
+    I: Des + Send + 'static
+{
+    let p = parser(prefetch);
+    move |r: Response<Body>| {
+        let content_type = extract_content_type_from_response(&r);
+        let content_length = parse_content_length(r.headers().get(CONTENT_LENGTH));
+        let body = r.into_body();
+        p(content_type, content_length, body)
+    }
 }
 
 /*
-pub fn make_response<O>(o: Output<O>, mut r: ResponseBuilder) -> ZResult<Response<Body>> where O: Ser {
-    let r = match o {
-        Output::Empty =>
-            Ok(r.body(Body::empty())?),
-        Output::Raw(js_value) => {
-            r.header(CONTENT_TYPE, APPLICATION_JSON.as_ref());
-            let data =  serde_json::to_vec(&js_value)?;
-            //let dlen = data.len();
-            //req.header(hyper::header::CONTENT_LENGTH, dlen as u64);
-            let body: Body = data.into();
-            Ok(r.body(body)?)
-        }
-        Output::Typed(o) => {
-            r.header(CONTENT_TYPE, APPLICATION_JSON.as_ref());
-            let data =  serde_json::to_vec(&o)?;
-            //let dlen = data.len();
-            //req.header(hyper::header::CONTENT_LENGTH, dlen as u64);
-            let body: Body = data.into();
-            Ok(r.body(body)?)
-        }
-        Output::Stream(s, mime) => {
-            r.header(CONTENT_TYPE, mime.as_ref());
-            Ok(r.body(Body::wrap_stream(s.map_err(|e| Box::new(e))))?)
-        }
-        Output::Error(e) =>
-            Err(e)
-
-    };
-    r.into()
-}
-
-
-pub fn make_request<O>(o: Output<O>, mut r: RequestBuilder) -> ZResult<Request<Body>> where O: Ser {
-    let r = match o {
-        Output::Empty =>
-            Ok(r.body(Body::empty())?),
-        Output::Raw(js_value) => {
-            r.header(CONTENT_TYPE, APPLICATION_JSON.as_ref());
-            let data =  serde_json::to_vec(&js_value)?;
-            //let dlen = data.len();
-            //req.header(hyper::header::CONTENT_LENGTH, dlen as u64);
-            let body: Body = data.into();
-            Ok(r.body(body)?)
-        }
-        Output::Typed(o) => {
-            r.header(CONTENT_TYPE, APPLICATION_JSON.as_ref());
-            let data =  serde_json::to_vec(&o)?;
-            //let dlen = data.len();
-            //req.header(hyper::header::CONTENT_LENGTH, dlen as u64);
-            let body: Body = data.into();
-            Ok(r.body(body)?)
-        }
-        Output::Stream(s, mime) => {
-            r.header(CONTENT_TYPE, mime.as_ref());
-            Ok(r.body(Body::wrap_stream(s.map_err(|e| Box::new(e))))?)
-        }
-        Output::Error(e) =>
-            Err(e)
-
-    };
-    r.into()
-}
-
-pub fn parse_response<I>(r: Response<Body>, parse_as: InputType) -> Input<I> where I: Des + 'static {
-    use hyper::body::Payload;
-    fn check_content_type(r: Response<Body>) -> ZResult<Response<Body>> {
-        let m = r.headers()
-            .get(CONTENT_TYPE)
-            .map(|s| s.to_str().map(|x| Mime::from_str(x)));
-        match m {
-            Some(Ok(Ok(ref ct))) if ct.type_() == APPLICATION && ct.subtype() == JSON =>
-                Ok(r),
-            Some(Ok(Ok(ref ct))) =>
-                Err(rest_error!(other "invalid content type `{}`", ct)),
-            Some(Ok(Err(ect))) =>
-                Err(ect.into()),
-            Some(Err(ect)) =>
-                Err(ect.into()),
-            None =>
-                Err(rest_error!(other "no content type found (application/json required)"))
-        }
-    }
-
-    fn as_json<I>(r: Response<Body>, typed: bool) -> Input<I> where I: Des + 'static {
-        let y =
-            future::result(check_content_type(r)).and_then(|res|
-                res.into_body().concat2().map_err(|err| err.into())
-            );
-        if typed {
-            Input::Typed(Box::new(y.and_then(|body| serde_json::from_slice(&body).map_err(|err| err.into()))))
-        } else {
-            Input::Raw(Box::new(y.and_then(|body| serde_json::from_slice(&body).map_err(|err| err.into()))))
-        }
-    }
-
-    match parse_as {
-        InputType::Empty =>
-            if r.body().is_end_stream() {
-                Input::Empty
-            } else {
-                Input::Error(rest_error!(other "Non-empty body where empty is expected"))
-            }
-        InputType::Raw => as_json(r, false),
-        InputType::Typed => as_json(r, true),
-        InputType::Stream => Input::Stream(Box::new(r.into_body().map_err(|e| e.into()))),
-        InputType::Discard => Input::Empty
-    }
-}
-
-pub fn parse_request<I>(r: Request<Body>, parse_as: InputType) -> Input<I> where I: Des + 'static {
-    use hyper::body::Payload;
-    fn check_content_type(r: Request<Body>) -> ZResult<Request<Body>> {
-        let m = r.headers()
-            .get(CONTENT_TYPE)
-            .map(|s| s.to_str().map(|x| Mime::from_str(x)));
-        match m {
-            Some(Ok(Ok(ref ct))) if ct.type_() == APPLICATION && ct.subtype() == JSON =>
-                Ok(r),
-            Some(Ok(Ok(ref ct))) =>
-                Err(rest_error!(other "invalid content type `{}`", ct)),
-            Some(Ok(Err(ect))) =>
-                Err(ect.into()),
-            Some(Err(ect)) =>
-                Err(ect.into()),
-            None =>
-                Err(rest_error!(other "no content type found (application/json required)"))
-        }
-    }
-
-    fn as_json<I>(r: Request<Body>, typed: bool) -> Input<I> where I: Des + 'static {
-        let y =
-            future::result(check_content_type(r)).and_then(|res|
-                res.into_body().concat2().map_err(|err| err.into())
-            );
-        if typed {
-            Input::Typed(Box::new(y.and_then(|body| serde_json::from_slice(&body).map_err(|err| err.into()))))
-        } else {
-            Input::Raw(Box::new(y.and_then(|body| serde_json::from_slice(&body).map_err(|err| err.into()))))
-        }
-    }
-
-    match parse_as {
-        InputType::Empty =>
-            if r.body().is_end_stream() {
-                Input::Empty
-            } else {
-                Input::Error(rest_error!(other "Non-empty body where empty is expected"))
-            }
-        InputType::Raw => as_json(r, false),
-        InputType::Typed => as_json(r, true),
-        InputType::Stream => Input::Stream(Box::new(r.into_body().map_err(|e| e.into()))),
-        InputType::Discard => Input::Empty
+/// server-side request parser
+pub fn request_parser<I>(prefetch: impl FnOnce(Option<&Mime>, Option<u64>) -> InputType)
+                          -> impl FnOnce(Request<Body>) -> BIF<I> where
+    I: Des + Send + 'static
+{
+    let p = parser(prefetch);
+    move |r: Request<Body>| {
+        let content_type = extract_content_type_from_request(&r);
+        let content_length = parse_content_length(r.headers().get(CONTENT_LENGTH));
+        let body = r.into_body();
+        p(content_type, content_length, body)
     }
 }
 */

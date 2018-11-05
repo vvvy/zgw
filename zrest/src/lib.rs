@@ -20,8 +20,8 @@ mod common;
 mod data_io;
 pub mod auth;
 pub mod client;
-//mod tls_server;
+mod tls_server;
 #[macro_use] mod router;
-//#[macro_use] pub mod server;
+#[macro_use] pub mod server;
 //pub mod wrappers;
 

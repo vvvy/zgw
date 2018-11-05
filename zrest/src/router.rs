@@ -43,7 +43,7 @@ pub enum MCTR<'t> {
     Delete,
     Other
 }
-use std::str::FromStr;
+
 impl MCT {
     fn matches<'t>(&self, other: &MCTR<'t>) -> bool {
         fn matches_json(mct: &Mime) -> bool {
@@ -69,7 +69,6 @@ impl MCT {
 
     }
 }
-
 
 /// Condition for branching in the tree
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
@@ -497,7 +496,7 @@ impl<A> RTree<A> {
             RTreeBuildContext::create(b, a_failure);
 
         if let Some(m) = err {
-            return Err(ZError::Other(Cow::from(m)));
+            return Err(rest_error!(other m));
         }
 
         //label table. for each label (@offset), holds its offset within the resulting tree
